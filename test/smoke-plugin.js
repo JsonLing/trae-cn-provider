@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { assert, assertEqual, installShims, load, mockFetch, recordingLogger, sse, sseResponse, test } from './support.js';
+import { assert, assertEqual, installShims, load, mockFetch, recordingLogger, sse, sseResponse, test, userMessage } from './support.js';
 
 installShims();
 
@@ -201,6 +201,42 @@ await test('apply() registers the provider, the adapter and the mount', async ()
     assertEqual(calls.mounts[0].kind, 'prefix', 'mount is a prefix route');
     assertEqual(calls.mounts[0].path, '/trae-cn', 'mount prefix');
     assert(api?.adapter, 'apply returns the adapter handle');
+  } finally {
+    mock.restore();
+  }
+});
+
+await test('prepareCall().stream() returns an AsyncIterable, not a promise of one', async () => {
+  // The harness (`dsh-llm` -> adapterStream) dereferences `Symbol.asyncIterator`
+  // *synchronously* on whatever `prepareCall().stream()` returns, so it must be
+  // an async iterable itself. An earlier bug pointed `stream` at the async
+  // `streamWithInfo`, which resolves to the iterable — a Promise — and every
+  // model call died instantly with
+  // `dispatch(...)[Symbol.asyncIterator] is not a function`.
+  const mock = mockFetch((url) => {
+    if (url.includes('get_detail_param')) return CATALOG;
+    if (url.includes('llm_utils_chat')) return sseResponse(CHAT_SSE);
+    throw new Error(`unexpected url ${url}`);
+  });
+  const { ctx, calls } = makeCtx();
+  try {
+    plugin.apply(ctx, { credentialSource: 'oauth', ideVersion: ENV.ideVersion, appVersionCode: ENV.appVersionCode });
+    const adapter = calls.adapters[0].adapter;
+
+    const prepared = await adapter.prepareCall('trae-cn', 'glm-5.2', undefined);
+    const dispatched = prepared.stream({ provider: 'trae-cn', model: 'glm-5.2', messages: [userMessage('hi')] });
+
+    // Synchronous contract the host enforces.
+    assert(
+      typeof dispatched?.[Symbol.asyncIterator] === 'function',
+      `stream() must be an AsyncIterable, got ${dispatched?.constructor?.name ?? typeof dispatched}`,
+    );
+
+    // And it still produces the real chunk stream end to end.
+    const chunks = [];
+    for await (const chunk of dispatched) chunks.push(chunk.type);
+    assert(chunks.includes('text-delta') || chunks.includes('block-start'), `stream delivered content chunks, got ${chunks.join(',')}`);
+    assert(chunks.includes('finish'), `stream delivered a terminal finish, got ${chunks.join(',')}`);
   } finally {
     mock.restore();
   }

@@ -222,6 +222,7 @@ node src/cli.js chat "你好"
 
 插件对此的处理：
 - **`/trae-login` 的返回值必须符合宿主的 `CommandResult` 联合类型**。`@deepseek-ai/dsh-commands` 会在注册边界校验它（其 `lib/index.js` 的 `normalizeResult`），不合规就抛 `command "<名字>" returned unknown result kind "<kind>"`。它只接受两种形状：`{ kind: 'success', text?: string }` 与 `{ kind: 'error', text: string }`（**字段名是 `text`**，错误文本且必须非空）。这条以前写成 `{ kind: 'text' }`，于是**每次 `/trae-login` 都会先把登录做完、再在返回的那一刻抛错**。离线套件当时只验证了命令「已注册」而没验证它的返回值，所以没抓到；现在由 `lib/support.js` 的 `commandSuccess` / `commandFailure` 统一产出，并有测试对着上面这条契约守着。
+- **`prepareCall().stream()` 必须直接返回一个 AsyncIterable，不能返回「解析成 AsyncIterable 的 Promise」**。`dsh-llm@0.2.0-rc.2` 的 `adapterStream` 对 `dispatch(...)` 的返回值**同步**解引用 `[Symbol.asyncIterator]()`，拿到 Promise 就直接抛 `dispatch(...)[Symbol.asyncIterator] is not a function` —— 于是**每一次 Trae 模型调用都是立刻失败**。这条以前把 `stream` 对准了 async 的 `streamWithInfo`（它 `await` 之后才返回 chunk 生成器，等于返回 Promise）。现在由 `prepareCall()` 返回 `stream: (options) => this.streamPrepared(...)`，`streamPrepared` 是一个 async generator，`yield* await this.streamWithInfo(...)` 把「先用 Promise 完成建连、再把 chunk 流扇出」的既有时序原样保留；`test/smoke-plugin.js` 里有对着同步契约（`typeof dispatched[Symbol.asyncIterator] === 'function'`）的回归测试守着。
 - **企业版/租户主机上会在两个刷新端点之间自动降级**。需要设备签名的 `/trae/api/v3/oauth/ExchangeToken` 在 `console.enterprise.trae.cn` 这类租户主机上**根本不存在**（网关回 404 + HTML），而免签名的 `/cloudide/api/v3/trae/oauth/ExchangeToken` 存在。所以刷新会先试签名那条，**只有在端点确实缺失（404/405）时**才退到免签名那条；如果服务器是**主动拒绝**签名，则原样抛出，绝不悄悄降级到更弱的流程。
 - **access token 还没真过期时，刷新失败不致命**。`needsRefresh()` 提前 30 分钟触发，所以这半小时内一次短暂刷新失败会**降级为警告 + 继续用现有凭据**，而不是把本来还能成功的请求打掉。只有 token 真的过期了才硬失败。
 - 硬失败时不再原样抛出「网络异常」，而是抛 `LlmError('REFRESH_FAILED')`，消息里说明「refresh token 已失效」并给出重登命令，同时保留原始上游原因便于排查。
@@ -302,7 +303,7 @@ smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**�
 
 - `smoke-adapter.js` — `LlmAdapter` 契约：目录映射、chunk 序列、思考档位、工具调用、usage 映射，以及**凭据刷新的三条不变量**（并发调用只刷新一次、401 只重试一次不会无限循环、失效 refresh token 报可操作的 `REFRESH_FAILED`）
 - `smoke-client.js` — 上游客户端与凭据：企业版刷新主机、双响应信封、回调解析、tc 解密
-- `smoke-plugin.js` — **插件入口 `apply()`**：Config 是否是可被 cordis 校验的 Standard Schema、provider/adapter 是否按契约注册、挂载的 OpenAI 接口是否真的能应答
+- `smoke-plugin.js` — **插件入口 `apply()`**：Config 是否是可被 cordis 校验的 Standard Schema、provider/adapter 是否按契约注册、挂载的 OpenAI 接口是否真的能应答，以及 **`prepareCall().stream()` 同步返回 AsyncIterable**（防 `[Symbol.asyncIterator] is not a function` 回归）
 - `smoke-login.js` — **`/trae-login` 命令全链路**：命令注册 → `webLogin` → 授权链接 → **合成 Trae 的真实回调** → 凭据落盘。它把 `openInApp` 换成桩（否则会真的弹出浏览器），并用 `TRAE_PROXY_CRED_DIR` 隔离凭据文件，**不会碰你真实的登录态**
 
 另有两个**需要联网的手动脚本**（不在 `npm run check` 里）：
@@ -483,6 +484,7 @@ npx -p @jieai/dsh-plugin-vet vet-gate --package node_modules/trae-cn-provider
 | OpenAI 兼容 `/v1/models` + `/v1/chat/completions` | ✅ 流式 + 非流式 + 工具 + 图片实测 |
 | 打包成 DSH bundle 插件 | ✅ 从 tarball 安装并启动验证 |
 | 在本机验证可用 | ✅ 在 DSH **0.1.2-rc.1** 与 **0.2.0-rc.2** 上分别验证 provider 注册与调用 |
+| `prepareCall().stream()` 适配 0.2.0-rc.2 的同步解引用 | ✅ `streamPrepared` async generator + 回归测试（0.1.3） |
 | 走通发布流程 | ⚠️ `npm pack` 与 `npm publish --dry-run` 均已通过；**实际 `npm publish` 需要账号持有者执行**（DSH 没有官方市场，分发渠道就是 npm） |
 
 因此剩余步骤只有两个，且都**必须由账号持有者本人操作**：
