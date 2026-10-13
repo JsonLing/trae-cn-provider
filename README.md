@@ -431,9 +431,26 @@ dsh plugin --profile desktop add trae-cn-provider   # 需先完全退出桌面�
 | 仓库含可扫描源码 | ✅ 15 个 JS 文件 |
 | 安全扫描无阻断级发现 | ⚠️ 见下 |
 
-**关于安全扫描的风险，先说清楚**：它针对 JS/TS 做 AST 分析，找的是硬编码密钥、**数据外传端点**、破坏性操作、挖矿特征。本包在「外传」这一项上是干净的（出网域名全部是 Trae 官方的，见上文清单），但有两处值得留意：
+**关于安全扫描的风险，先说清楚**：它针对 JS/TS 做 AST 分析，找的是硬编码密钥、**数据外传端点**、破坏性操作、挖矿特征。而 dsh.so 页面上标注的扫描技术提供商是 [`dsh-plugin-vet`](https://github.com/wulun811/dsh-plugin-vet)（即 `@jieai/dsh-plugin-vet`），**它本身是可公开获取的**，所以提交前可以先自己用同一把尺子量一遍：
 
-- **`credentialSource: local` 会解密本机 Trae 的凭据存储**。这是本仓库最可能被判定为「凭据采集」的地方。它的默认值是 `oauth`（不碰任何解密），但代码路径确实在包里。
+```sh
+npx -p @jieai/dsh-plugin-vet vet-gate --package node_modules/trae-cn-provider
+```
+
+`0.1.0` 的实测结果：
+
+```
+"blocked": false
+"verdict": "clean"
+32 findings — all severity: info
+  R3  x26   只读 process 成员（能力触达面）
+  R15 x2    fetch 目标由运行时构造，静态不可审计（启发式）
+  R6/R9/R10  各 1
+```
+
+即**无 medium/high/critical 发现**。两个值得留意的点仍在，供人工复核时对照：
+
+- **`credentialSource: local` 会解密本机 Trae 的凭据存储**。默认值是 `oauth`（不碰任何解密），但代码路径确实在包里。详见 [SECURITY.md](./SECURITY.md)。
 - **`test/` 里的测试语料含有形如 token 的字符串**（都是 `fake-` 前缀的假值）。社区里有先例：扫描器曾把插件的测试语料当成插件的危险行为（[deepseek-harness#2818](https://github.com/deepseek-ai/deepseek-harness/discussions/2818)）。
 
 检查器在**提交之前**就会给出报告，所以先跑检查、看结论，再决定要不要提交。
