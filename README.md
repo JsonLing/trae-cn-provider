@@ -205,7 +205,7 @@ node src/cli.js chat "你好"
 | token 刷新 | OAuth 与 local **两条来源都曾刷新成功**（走账号自己的 host、双信封解析）。**注意 refresh token 会被作废**，见下方「refresh token 会失效」 |
 | 过期触发刷新链路 | `test/live-refresh.js` 用隔离的凭据副本把 `expiresAt` 强制到过去，验证「过期 → 自动刷新 → 请求成功 → 新 token 落盘」；当前该凭据的 refresh token 已失效，**需要重新登录后本项才能通过**（脚本会明确诊断，不会让你误以为插件坏了） |
 | adapter 端到端 | `listModels` 7 个 / `resolveModel` 上下文正确 / `stream` 正文+思考+usage+工具调用 |
-| 跨 DSH 版本 | 在 **0.1.2-rc.1** 与 **0.2.0-rc.2** 两个宿主上分别启动并验证：provider 注册、7 个模型、`resolveModelInfo`、挂载接口（health / models / 流式 / 非流式）全部通过 |
+| 跨 DSH 版本 | 在 **0.1.2-rc.1**、**0.2.0-rc.2**、**0.2.1-alpha.2** 三个宿主上分别启动并验证：provider 注册、7 个模型、`resolveModelInfo`、挂载接口（health / models / 对话）全部通过。后两个分别对应桌面应用打包的版本与 npm 上的最新版 |
 
 **企业版账号的两个坑**（同类项目基本没处理，会导致刷新永远失败）：
 
