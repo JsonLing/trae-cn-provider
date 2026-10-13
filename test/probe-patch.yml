@@ -1,0 +1,7 @@
+# Verification-only overlay: `dsh --profile web --patch test/probe-patch.yml`
+#
+# `name` is resolved relative to this file's directory, so the bare relative
+# path reaches test/probe-catalog.mjs. Not part of the published bundle.
+- insert:
+    - id: trae-probe
+      name: './probe-catalog.mjs'

@@ -1,0 +1,42 @@
+# Bundle patch layer for trae-cn-provider.
+#
+# A third-party bundle inserts its own entry without an `id` of its own; the
+# `name` on the inserted row is the **module specifier**, resolved relative to
+# the directory holding this patch file, which is why it is the bare package
+# name rather than a path.
+#
+# The entry id `trae-cn` becomes the settings namespace the Models page opens
+# for this route (lib/index.js falls back to the plugin name if the id is
+# absent).
+- insert:
+    - id: trae-cn
+      name: 'trae-cn-provider'
+      config:
+        # oauth (default) = browser login only.
+        # local          = read this machine's Trae install, no browser.
+        # auto           = saved oauth login first, then the local install.
+        #
+        # `local` is opt-in on purpose: selecting it puts a credential-decrypting
+        # path into play. See README "本机凭据来源（local / auto）".
+        credentialSource: oauth
+        # Only consulted for credentialSource: local | auto.
+        edition: cn
+        # The verified wire shape (see PROTOCOL.md §B). `chat_v3` is the one
+        # measured to round-trip text, reasoning, usage and native function
+        # calling against the real endpoint. `inline_chat` is experimental and
+        # is measured failing; do not make it the default.
+        requestStyle: chat_v3
+        # x-app-version-code / x-ide-version-code. MUST be a pure integer:
+        # upstream answers a dotted value with
+        # {"code":4001,"message":"bad request: binding: expr_path=app_version_code,
+        #  cause=parameter type does not match binding data"}.
+        appVersionCode: 20260401
+        # x-ide-version; empty means detect it from the local Trae install.
+        ideVersion: ''
+        displayName: 'Trae CN'
+        loginCommand: trae-login
+        settingsNs: trae-cn-provider
+        mountOpenAIEndpoint: true
+        # Mount prefix on the host web server. The mounted handler owns the
+        # `/v1/...` routes, so `/trae-cn` exposes `/trae-cn/v1/...`.
+        openAIPath: /trae-cn

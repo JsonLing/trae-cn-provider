@@ -1,0 +1,15 @@
+# Verification-only overlay: exercise the `credentialSource: local` path through
+# the plugin's own credential store.
+#
+#   dsh --patch test/probe-local-patch.yml --profile web --no-open --port 18318
+#
+# Applied after the bundle's own patch layer, so this replaces the whole
+# `config` object. `name` is an assertion: it must match the target entry's
+# module specifier.
+#
+# Not part of the published bundle.
+- id: trae-cn
+  name: 'trae-cn-provider'
+  config:
+    credentialSource: local
+    edition: cn

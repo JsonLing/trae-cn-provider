@@ -1,0 +1,15 @@
+# Third-party reference sources.
+#
+# These are Trae-Relay's C++ sources, downloaded only to read the wire protocol
+# out of them (see PROTOCOL.md). The upstream repository ships NO LICENSE, so
+# they must never be redistributed or committed.
+reference/
+
+# Publish artifacts and installed dependencies
+*.tgz
+node_modules/
+
+# Local scratch
+.DS_Store
+__pycache__/
+*.log

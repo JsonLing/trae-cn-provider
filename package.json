@@ -1,0 +1,97 @@
+{
+  "name": "trae-cn-provider",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Trae CN as a native DeepSeek Harness LLM provider: browser OAuth login by default, optional local-install credential source, OpenAI-compatible surface on the host web server",
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/adapter.js",
+    "lib/attachments.js",
+    "lib/attribution.js",
+    "lib/chat-body.js",
+    "lib/credentials.js",
+    "lib/llm.js",
+    "lib/messages.js",
+    "lib/support.js",
+    "src/env.js",
+    "src/trae-auth.js",
+    "src/trae-client.js",
+    "src/trae-local-credentials.js",
+    "src/openai-server.js",
+    "src/cli.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "bin": {
+    "trae-cn": "src/cli.js"
+  },
+  "scripts": {
+    "login": "node src/cli.js login",
+    "models": "node src/cli.js models",
+    "serve": "node src/cli.js serve",
+    "chat": "node src/cli.js chat",
+    "check": "bash test/check.sh",
+    "test": "node test/smoke-adapter.js && node test/smoke-client.js && node test/smoke-plugin.js && node test/smoke-login.js",
+    "prepublishOnly": "npm run check"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.1.2-rc.1": "compatible",
+        "0.2.0-rc.2": "compatible"
+      }
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "trae",
+    "trae-cn",
+    "llm",
+    "provider"
+  ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-credentials": ">=0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1",
+    "@deepseek-ai/dsh-launch-environment": ">=0.1.2-rc.1",
+    "@deepseek-ai/cordis-plugin-loader": "~1.0.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/cordis-plugin-loader": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-credentials": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-launch-environment": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    }
+  }
+}
