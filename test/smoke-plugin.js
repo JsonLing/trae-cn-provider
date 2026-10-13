@@ -16,10 +16,51 @@
 //      mounted request failed as an opaque 400.
 //
 //   node test/smoke-plugin.js
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { assert, assertEqual, installShims, load, mockFetch, recordingLogger, sse, sseResponse, test } from './support.js';
 
 installShims();
+
+// Hermetic credentials.
+//
+// This suite drives `apply()` with the default `credentialSource: 'oauth'`, so
+// without this it would read the developer's own ~/.trae-proxy/credentials.json
+// — passing on a machine that happens to be logged in and failing on a fresh
+// clone or in CI. That is a test that passes for the wrong reason.
+//
+// `src/env.js` reads TRAE_PROXY_CRED_DIR at import time, so this has to run
+// before the plugin module is loaded.
+const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'trae-plugin-'));
+process.env.TRAE_PROXY_CRED_DIR = path.join(SCRATCH, '.trae-proxy');
+const CRED_FILE = path.join(SCRATCH, '.trae-proxy', 'credentials.json');
+
+const STUB_CREDS = {
+  source: 'oauth',
+  clientId: 'client-under-test',
+  token: 'fake-access-token-not-a-real-secret',
+  refreshToken: 'fake-refresh-token',
+  userId: '429404416',
+  // Already in the past-but-truthy range that needsRefresh() ignores, so no
+  // refresh is attempted and the mocked fetch is the only traffic.
+  expiresAt: 0,
+  host: 'https://api.trae.cn',
+  deviceInfo: { DeviceID: 'device-1', MachineID: 'machine-1' },
+};
+const writeStubCredentials = () => {
+  fs.mkdirSync(path.dirname(CRED_FILE), { recursive: true });
+  fs.writeFileSync(CRED_FILE, JSON.stringify(STUB_CREDS), { mode: 0o600 });
+};
+const hideStubCredentials = () => {
+  try {
+    fs.rmSync(CRED_FILE);
+  } catch {
+    /* already absent */
+  }
+};
+writeStubCredentials();
 
 const plugin = await load('lib/index.js');
 const { TraeProvider } = await load('src/openai-server.js');
@@ -57,16 +98,6 @@ const CHAT_SSE = [
 ].join('');
 
 const ENV = { ideVersion: '3.4.1', appVersionCode: 20260401, ideVersionCode: '20260401', source: 'test' };
-const CREDS = {
-  source: 'oauth',
-  clientId: 'client-under-test',
-  token: 'fake-access-token-not-a-real-secret',
-  refreshToken: 'fake-refresh-token',
-  userId: '429404416',
-  expiresAt: 0,
-  host: 'https://api.trae.cn',
-  deviceInfo: { DeviceID: 'device-1', MachineID: 'machine-1' },
-};
 
 /** A ctx covering exactly what `apply()` touches: effect / fiber / get / llm / logger. */
 function makeCtx({ withWebServer = true } = {}) {
@@ -238,22 +269,35 @@ await test('apply() tolerates a host without the webServer service', async () =>
   }
 });
 
-await test('a missing credential never crashes and never leaks a secret', async () => {
+await test('a missing credential is a clear error, never a crash or a leak', async () => {
   const mock = mockFetch(() => {
     throw new Error('no request should be made without credentials');
   });
-  const { ctx } = makeCtx();
+  const { ctx, calls } = makeCtx();
+  hideStubCredentials();
   try {
+    // apply() itself must stay inert with no login present.
     plugin.apply(ctx, { credentialSource: 'oauth', ideVersion: ENV.ideVersion, appVersionCode: ENV.appVersionCode });
-    // Nothing above may throw: the plugin must be inert until a login exists.
-    assert(true, 'apply() completed without credentials');
+    assertEqual(calls.adapters.length, 1, 'the adapter is still registered');
+
+    let caught;
+    try {
+      await calls.adapters[0].adapter.listModels('trae-cn');
+    } catch (err) {
+      caught = err;
+    }
+    assert(caught, 'asking for models rejects rather than returning garbage');
+    assertEqual(caught.code, 'MISSING_CREDENTIAL', 'a stable code');
+    assert(/trae-login/.test(caught.message), 'the message names the login command');
+    assert(!/fake-access-token|fake-refresh-token/.test(caught.message), 'no token in the message');
   } finally {
+    writeStubCredentials();
     mock.restore();
   }
 });
 
 // Referenced so the fixture is not mistaken for dead code if the suites change.
 assert(TraeProvider, 'the OpenAI surface provider is importable');
-assert(CREDS.token.startsWith('fake-'), 'the fixture token is obviously fake');
+assert(STUB_CREDS.token.startsWith('fake-'), 'the fixture token is obviously fake');
 
 console.log(process.exitCode ? 'smoke-plugin: FAILED' : 'smoke-plugin: PASSED');

@@ -31,12 +31,27 @@ function link(target, linkPath) {
   }
 }
 
-/** Make bare `@deepseek-ai/*` specifiers resolvable from the temp work dir. */
+/**
+ * Best-effort compatibility shim.
+ *
+ * Resolution for the `@deepseek-ai/*` packages actually comes from two places,
+ * in order: this checkout's own `devDependencies` (installed by `npm install`,
+ * which is what CI and a fresh clone rely on), or `lib/llm.js`'s fallback roots
+ * (which find a locally installed DSH when there is no `node_modules`).
+ *
+ * The symlink farm this used to build was never on either path, yet it threw
+ * when the DSH install was absent — so a fresh clone could not run the very
+ * command the README tells people to run. It is now best-effort on purpose.
+ */
 export function installShims() {
   for (const name of [...NEEDED, ...LINKED]) {
     const source = path.join(DSH_NODE_MODULES, name);
-    if (!fs.existsSync(source)) throw new Error(`missing DSH dependency: ${source}`);
-    link(source, path.join(SHIM, name));
+    if (!fs.existsSync(source)) continue;
+    try {
+      link(source, path.join(SHIM, name));
+    } catch {
+      /* best effort only */
+    }
   }
 }
 
