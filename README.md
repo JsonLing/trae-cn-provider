@@ -414,6 +414,32 @@ dsh plugin --profile desktop add trae-cn-provider   # 需先完全退出桌面�
 
 所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、四套 smoke）。
 
+### 上架 dsh.so（社区插件市场）
+
+`dsh.so` 是社区维护的 DSH 插件市场（收录 1.7 万+ 条目，带 L1–L5 验证等级）。**先发布到 npm，再去提交** —— 因为它的检查对象**恒为已发布的 tarball**，不是仓库。
+
+要到 <https://www.dsh.so/zh/submit/> 粘贴仓库地址或 npm 包名，检查器会拉取、校验格式、跑安全扫描，通过后生成一份条目供审核。
+
+它的接受标准，逐条对照本包：
+
+| 标准 | 本包 |
+|---|---|
+| DSH 兼容信号（`dsh` 字段 / cordis manifest / `dsh-plugin` 话题） | ✅ `dsh.bundle.patch` + `dsh.compatibility`，仓库已打 `dsh-plugin` 话题 |
+| README 带安装说明 | ✅ 「安装」小节 |
+| SPDX 可识别的开源许可证 | ✅ MIT + `LICENSE` |
+| 插件 id 符合 `^[a-z0-9]+(-[a-z0-9]+)*$` | ✅ `trae-cn-provider` |
+| 仓库含可扫描源码 | ✅ 15 个 JS 文件 |
+| 安全扫描无阻断级发现 | ⚠️ 见下 |
+
+**关于安全扫描的风险，先说清楚**：它针对 JS/TS 做 AST 分析，找的是硬编码密钥、**数据外传端点**、破坏性操作、挖矿特征。本包在「外传」这一项上是干净的（出网域名全部是 Trae 官方的，见上文清单），但有两处值得留意：
+
+- **`credentialSource: local` 会解密本机 Trae 的凭据存储**。这是本仓库最可能被判定为「凭据采集」的地方。它的默认值是 `oauth`（不碰任何解密），但代码路径确实在包里。
+- **`test/` 里的测试语料含有形如 token 的字符串**（都是 `fake-` 前缀的假值）。社区里有先例：扫描器曾把插件的测试语料当成插件的危险行为（[deepseek-harness#2818](https://github.com/deepseek-ai/deepseek-harness/discussions/2818)）。
+
+检查器在**提交之前**就会给出报告，所以先跑检查、看结论，再决定要不要提交。
+
+收录后兼容性只会标记为 **Declared（作者声明）**；L5「运行验证通过」需要 dsh.so 自己针对具体 DSH 版本实测。你也可以按它给的模板到官方 Discussions 发兼容性报告，帮助把条目升到 Verified。
+
 ---
 
 发布前检查清单：

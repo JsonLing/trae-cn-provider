@@ -13,3 +13,10 @@ node_modules/
 .DS_Store
 __pycache__/
 *.log
+
+# Pending the `workflow` OAuth scope on the pushing account: the token used by
+# `gh` may not create or update workflow files, and a plain `git add -A` would
+# then fail the push with "refusing to allow an OAuth App to create or update
+# workflow". Remove this line (and push the file) once the scope is granted:
+#   gh auth refresh -s workflow
+.github/workflows/check.yml
