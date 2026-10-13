@@ -69,16 +69,30 @@ try {
   check(models.length > 0, 'a request with an expired token succeeds', `${models.length} models`);
 
   const refreshCalls = seen.filter((u) => u.includes('/oauth/ExchangeToken'));
-  check(refreshCalls.length >= 1, 'the refresh endpoint was called', refreshCalls[0] ?? '(none)');
+  check(refreshCalls.length >= 1, 'a refresh endpoint was called', refreshCalls.join(' → ') || '(none)');
   check(
     refreshCalls.every((u) => u.startsWith(original.host)),
-    'the refresh used the account\'s own host',
+    'every refresh attempt used the account\'s own host',
     `expected prefix ${original.host}`,
   );
   check(
     refreshCalls.every((u) => !u.startsWith('https://api.trae.cn')),
     'the refresh did NOT fall back to the hardcoded api.trae.cn',
   );
+
+  // Tenant hosts (console.enterprise.trae.cn and friends) do not expose the
+  // device-proof exchange endpoint — it answers 404 there — so the refresh has
+  // to settle on the no-signature `/cloudide/...` one. Assert the *last*
+  // attempt, which is the one that actually produced the token.
+  const tenantHost = !/^https:\/\/api\.trae\.cn/.test(original.host ?? '');
+  const settled = refreshCalls[refreshCalls.length - 1] ?? '';
+  if (tenantHost) {
+    check(
+      settled.includes('/cloudide/api/v3/trae/oauth/ExchangeToken'),
+      'a tenant host settled on the cloudide exchange endpoint',
+      settled,
+    );
+  }
 
   const rotated = JSON.parse(fs.readFileSync(SCRATCH_CRED, 'utf8'));
   check(rotated.token !== stale.token, 'the access token was rotated');

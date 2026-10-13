@@ -14,6 +14,7 @@
 //     can never overwrite the real ~/.trae-proxy/credentials.json.
 //
 //   node test/smoke-login.js
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -138,6 +139,85 @@ await test('a host without the commands service degrades instead of failing', as
     // Must not throw: the plugin is optional-commands.
     plugin.apply(ctx, { credentialSource: 'oauth', ...ENV });
     assertEqual(registered.length, 0, 'nothing registered without the service');
+  } finally {
+    mock.restore();
+  }
+});
+
+await test('a tenant host falls back to the cloudide exchange endpoint on 404', async () => {
+  // Measured on console.enterprise.trae.cn: the device-proof exchange endpoint
+  // is absent there (404 with an HTML body) while the no-signature
+  // `/cloudide/...` one works. Without the fallback, every refresh on an
+  // enterprise account fails and the plugin dies when the token expires.
+  const { refreshToken } = await load('src/trae-auth.js');
+  const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+
+  const mock = mockFetch((url) => {
+    if (url.includes('/trae/api/v3/oauth/ExchangeToken')) return { body: 'Not Found', status: 404 };
+    return {
+      code: 0,
+      Data: {
+        Token: 'access-2',
+        RefreshToken: 'refresh-2',
+        TokenExpireAt: new Date(Date.now() + 3600_000).toISOString(),
+      },
+    };
+  });
+
+  try {
+    const out = await refreshToken(
+      {
+        refreshToken: 'refresh-1',
+        clientId: 'client-under-test',
+        userId: '42',
+        host: 'https://console.enterprise.trae.cn',
+        privateKeyPem,
+        deviceInfo: { DeviceID: 'device-1', MachineID: 'machine-1' },
+      },
+      ENV.ideVersion,
+    );
+
+    assertEqual(mock.calls.length, 2, 'both endpoints were attempted');
+    assert(mock.calls[0].url.includes('/trae/api/v3/oauth/ExchangeToken'), 'the device-proof endpoint first');
+    assert(mock.calls[1].url.includes('/cloudide/api/v3/trae/oauth/ExchangeToken'), 'then the cloudide endpoint');
+    assert(mock.calls[1].url.startsWith('https://console.enterprise.trae.cn'), 'still the account\'s own host');
+    assertEqual(out.token, 'access-2', 'the rotated access token is used');
+    assertEqual(out.refreshToken, 'refresh-2', 'the refresh token rotated too');
+  } finally {
+    mock.restore();
+  }
+});
+
+await test('a rejected device proof surfaces instead of silently downgrading', async () => {
+  // Only a *missing* endpoint justifies the weaker no-signature flow. If the
+  // server actively refuses the proof, that is an authentication failure and
+  // must not be papered over by retrying without it.
+  const { refreshToken } = await load('src/trae-auth.js');
+  const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+
+  const mock = mockFetch(() => ({ code: 40000, message: 'device proof rejected' }));
+
+  try {
+    let caught;
+    try {
+      await refreshToken(
+        {
+          refreshToken: 'refresh-1',
+          clientId: 'client-under-test',
+          host: 'https://api.trae.cn',
+          privateKeyPem,
+          deviceInfo: { DeviceID: 'device-1', MachineID: 'machine-1' },
+        },
+        ENV.ideVersion,
+      );
+    } catch (err) {
+      caught = err;
+    }
+    assert(caught, 'the rejection surfaced as an error');
+    assert(/40000/.test(caught.message), 'the upstream reason is preserved');
+    assertEqual(mock.calls.length, 1, 'no fallback was attempted');
   } finally {
     mock.restore();
   }

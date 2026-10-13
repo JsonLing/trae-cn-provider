@@ -60,13 +60,22 @@ async function postJson(url, body, headers = {}, timeoutMs = 30000) {
   try {
     json = JSON.parse(text);
   } catch {
-    throw new Error(`${url} 响应不是合法 JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    // Carry the status as data, not only inside the message: callers need to
+    // tell "this endpoint does not exist here" (404/405) apart from "the
+    // upstream refused this credential".
+    const err = new Error(`${url} 响应不是合法 JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    err.httpStatus = res.status;
+    throw err;
   }
   const err = json?.ResponseMetadata?.Error;
   if (err && (err.Code != null || err.Message != null)) {
     throw new Error(`上游拒绝: ${err.Code ?? ''} ${err.Message ?? ''}`.trim());
   }
-  if (!res.ok) throw new Error(`${url} HTTP ${res.status}: ${text.slice(0, 200)}`);
+  if (!res.ok) {
+    const err = new Error(`${url} HTTP ${res.status}: ${text.slice(0, 200)}`);
+    err.httpStatus = res.status;
+    throw err;
+  }
   // 两种信封：旧版 {Result:...}，企业版网关 {code, message, Data:...}
   if (typeof json?.code === 'number' && json.code !== 0) {
     throw new Error(`上游拒绝: ${json.code} ${json.message || ''}`.trim());
@@ -327,7 +336,6 @@ export async function refreshToken(creds, ideVersion) {
   const host = (creds.host || API_HOST).replace(/\/+$/, '');
   const useDeviceProof = Boolean(creds.privateKeyPem && creds.deviceInfo);
 
-  let result;
   if (useDeviceProof) {
     const timestamp = Math.floor(Date.now() / 1000);
     const nonce = crypto.randomUUID().replace(/-/g, '');
@@ -335,22 +343,34 @@ export async function refreshToken(creds, ideVersion) {
     const signature = crypto
       .sign('sha256', Buffer.from(payload, 'utf8'), { key: creds.privateKeyPem, dsaEncoding: 'der' })
       .toString('base64');
-    result = await postJson(`${host}${EXCHANGE_PATH}`, {
-      ClientID: creds.clientId,
-      ClientSecret: '',
-      RefreshToken: creds.refreshToken,
-      DeviceInfo: creds.deviceInfo,
-      DeviceProof: { Signature: signature, Timestamp: timestamp, Nonce: nonce },
-      IDEVersion: ideVersion,
-    });
-  } else {
-    result = await postJson(`${host}${SIMPLE_REFRESH_PATH}`, {
-      ClientID: creds.clientId || CLIENT_ID,
-      RefreshToken: creds.refreshToken,
-      ClientSecret: '-',
-      UserID: creds.userId,
-    });
+    try {
+      const result = await postJson(`${host}${EXCHANGE_PATH}`, {
+        ClientID: creds.clientId,
+        ClientSecret: '',
+        RefreshToken: creds.refreshToken,
+        DeviceInfo: creds.deviceInfo,
+        DeviceProof: { Signature: signature, Timestamp: timestamp, Nonce: nonce },
+        IDEVersion: ideVersion,
+      });
+      return applyToken({ ...creds }, result);
+    } catch (err) {
+      // Measured on console.enterprise.trae.cn: the device-proof endpoint does
+      // not exist on tenant hosts — the gateway answers 404 with an HTML body —
+      // while the no-signature `/cloudide/...` endpoint does (PROTOCOL.md).
+      // Fall back only when the endpoint is genuinely absent. A proof the
+      // server *rejected* is a real authentication failure and must surface
+      // unchanged, or a bad device key would silently downgrade to the weaker
+      // flow.
+      if (err?.httpStatus !== 404 && err?.httpStatus !== 405) throw err;
+    }
   }
+
+  const result = await postJson(`${host}${SIMPLE_REFRESH_PATH}`, {
+    ClientID: creds.clientId || CLIENT_ID,
+    RefreshToken: creds.refreshToken,
+    ClientSecret: '-',
+    UserID: creds.userId,
+  });
   return applyToken({ ...creds }, result);
 }
 

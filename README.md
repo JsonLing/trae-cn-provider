@@ -221,6 +221,7 @@ node src/cli.js chat "你好"
 - 因此：**access token 的有效期就是「不用重新登录」的上限**（实测 `TokenExpireDuration` 是 14 天）。
 
 插件对此的处理：
+- **企业版/租户主机上会在两个刷新端点之间自动降级**。需要设备签名的 `/trae/api/v3/oauth/ExchangeToken` 在 `console.enterprise.trae.cn` 这类租户主机上**根本不存在**（网关回 404 + HTML），而免签名的 `/cloudide/api/v3/trae/oauth/ExchangeToken` 存在。所以刷新会先试签名那条，**只有在端点确实缺失（404/405）时**才退到免签名那条；如果服务器是**主动拒绝**签名，则原样抛出，绝不悄悄降级到更弱的流程。
 - **access token 还没真过期时，刷新失败不致命**。`needsRefresh()` 提前 30 分钟触发，所以这半小时内一次短暂刷新失败会**降级为警告 + 继续用现有凭据**，而不是把本来还能成功的请求打掉。只有 token 真的过期了才硬失败。
 - 硬失败时不再原样抛出「网络异常」，而是抛 `LlmError('REFRESH_FAILED')`，消息里说明「refresh token 已失效」并给出重登命令，同时保留原始上游原因便于排查。
 - **401 之后的重试是真的会刷新**。这里曾经有个隐蔽 bug：旧代码靠写入 `expiresAt: 0` 来表示「强制刷新」，但 `needsRefresh()` 把 falsy 的过期时间当成「未知，不主动刷」，于是那次「重试」其实用的是同一枚刚被拒的 token。现在改成显式的 `ensureFresh(force = true)`。
