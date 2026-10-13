@@ -40,7 +40,8 @@
     "src/openai-server.js",
     "src/cli.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "SECURITY.md"
   ],
   "bin": {
     "trae-cn": "src/cli.js"

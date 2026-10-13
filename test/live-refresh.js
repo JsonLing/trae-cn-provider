@@ -107,5 +107,20 @@ try {
 }
 
 console.log(`\nlive-refresh: ${failures ? 'FAILED' : 'PASSED'}`);
-fs.rmSync(SCRATCH, { recursive: true, force: true });
+
+// Clean up the scratch dir, but only after proving it really is a scratch dir.
+// A recursive delete whose target is computed is exactly the shape a scanner
+// (rightly) treats as a destructive operation, so the check is explicit rather
+// than assumed.
+try {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const resolved = fs.realpathSync(SCRATCH);
+  if (resolved.startsWith(tmpRoot + path.sep)) {
+    fs.rmSync(resolved, { recursive: true, force: true });
+  } else {
+    console.warn(`live-refresh: refusing to clean up ${resolved} (outside ${tmpRoot})`);
+  }
+} catch {
+  /* already gone */
+}
 process.exit(failures ? 1 : 0);
