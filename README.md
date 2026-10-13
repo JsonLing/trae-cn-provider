@@ -221,6 +221,7 @@ node src/cli.js chat "你好"
 - 因此：**access token 的有效期就是「不用重新登录」的上限**（实测 `TokenExpireDuration` 是 14 天）。
 
 插件对此的处理：
+- **`/trae-login` 的返回值必须符合宿主的 `CommandResult` 联合类型**。`@deepseek-ai/dsh-commands` 会在注册边界校验它（其 `lib/index.js` 的 `normalizeResult`），不合规就抛 `command "<名字>" returned unknown result kind "<kind>"`。它只接受两种形状：`{ kind: 'success', text?: string }` 与 `{ kind: 'error', text: string }`（**字段名是 `text`**，错误文本且必须非空）。这条以前写成 `{ kind: 'text' }`，于是**每次 `/trae-login` 都会先把登录做完、再在返回的那一刻抛错**。离线套件当时只验证了命令「已注册」而没验证它的返回值，所以没抓到；现在由 `lib/support.js` 的 `commandSuccess` / `commandFailure` 统一产出，并有测试对着上面这条契约守着。
 - **企业版/租户主机上会在两个刷新端点之间自动降级**。需要设备签名的 `/trae/api/v3/oauth/ExchangeToken` 在 `console.enterprise.trae.cn` 这类租户主机上**根本不存在**（网关回 404 + HTML），而免签名的 `/cloudide/api/v3/trae/oauth/ExchangeToken` 存在。所以刷新会先试签名那条，**只有在端点确实缺失（404/405）时**才退到免签名那条；如果服务器是**主动拒绝**签名，则原样抛出，绝不悄悄降级到更弱的流程。
 - **access token 还没真过期时，刷新失败不致命**。`needsRefresh()` 提前 30 分钟触发，所以这半小时内一次短暂刷新失败会**降级为警告 + 继续用现有凭据**，而不是把本来还能成功的请求打掉。只有 token 真的过期了才硬失败。
 - 硬失败时不再原样抛出「网络异常」，而是抛 `LlmError('REFRESH_FAILED')`，消息里说明「refresh token 已失效」并给出重登命令，同时保留原始上游原因便于排查。

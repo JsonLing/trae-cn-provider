@@ -296,6 +296,46 @@ await test('a missing credential is a clear error, never a crash or a leak', asy
   }
 });
 
+await test('the login command returns a result the host accepts', async () => {
+  // `CommandResult` is a closed union validated at the registry boundary by
+  // @deepseek-ai/dsh-commands (`normalizeResult` in its lib/index.js), which
+  // throws `command "<name>" returned unknown result kind "<kind>"`. The entry
+  // used to return { kind: 'text', text }, so /trae-login completed the login
+  // and then threw on return — and nothing here caught it, because the suite
+  // asserted registration but never the handler's return value.
+  const { commandSuccess, commandFailure } = await load('lib/support.js');
+
+  // Mirrors the host's rules, quoted from that source.
+  const assertCommandResult = (label, value) => {
+    assert(value && typeof value === 'object', `${label}: handler must return a CommandResult`);
+    assert('kind' in value, `${label}: missing kind`);
+    if (value.kind === 'success') {
+      assert(
+        value.text === undefined || typeof value.text === 'string',
+        `${label}: success text must be a string when supplied`,
+      );
+      return;
+    }
+    if (value.kind === 'error') {
+      assert(
+        typeof value.text === 'string' && value.text.trim().length > 0,
+        `${label}: error text must be a non-empty string`,
+      );
+      return;
+    }
+    throw new Error(`${label}: unknown result kind "${String(value.kind)}"`);
+  };
+
+  assertCommandResult('commandSuccess', commandSuccess('已登录'));
+  assertCommandResult('commandFailure', commandFailure('登录失败：示例'));
+  assertEqual(commandSuccess('x').kind, 'success', "the success kind is 'success', not 'text'");
+  assertEqual(commandFailure('x').kind, 'error', "the failure kind is 'error'");
+  assertEqual(commandFailure('x').text, 'x', 'the failure field is `text`, not `message`');
+
+  // A success result without text is legal in the host's shape.
+  assertCommandResult('commandSuccess(undefined)', commandSuccess(undefined));
+});
+
 // Referenced so the fixture is not mistaken for dead code if the suites change.
 assert(TraeProvider, 'the OpenAI surface provider is importable');
 assert(STUB_CREDS.token.startsWith('fake-'), 'the fixture token is obviously fake');
