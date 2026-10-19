@@ -1,10 +1,11 @@
 {
   "name": "trae-cn-provider",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": false,
   "type": "module",
   "description": "Trae CN as a native DeepSeek Harness LLM provider: browser OAuth login by default, optional local-install credential source, OpenAI-compatible surface on the host web server",
   "license": "MIT",
+  "author": "jjjason <lingjie199302@gmail.com>",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/JsonLing/trae-cn-provider.git"

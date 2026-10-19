@@ -9,11 +9,13 @@ const APP_PATHS = [
 ];
 
 // x-ide-version / x-ide-version-code 必须与真实构建一致，
-// 用旧固定值会让 get_detail_param 返回旧模型目录。
+// 用旧固定值会让 get_detail_param 返回旧（残缺）模型目录。
 // 注意：上游要求 version code 是**纯数字**，带点的 tronBuildVersion 会直接 400
 // （binding: expr_path=app_version_code, cause=parameter type does not match binding data）；
-// 且网关按它决定加载哪套 function 配置，值太小会报 no function config found。
-const FALLBACK = { ideVersion: '3.4.1', appVersionCode: 20260401 };
+// 且网关按该数值的**大小**做灰度，值太小会返回更少的 function 配置。
+// 实测灰度阈值：20260401→42 条、20260701→46 条、>=20260901→57 条（完整目录）。
+const MIN_APP_VERSION_CODE = 20260901;
+const FALLBACK = { ideVersion: '3.4.1', appVersionCode: MIN_APP_VERSION_CODE };
 
 export function detectEnv() {
   for (const app of APP_PATHS) {

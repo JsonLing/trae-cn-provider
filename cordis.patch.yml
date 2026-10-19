@@ -30,7 +30,9 @@
         # upstream answers a dotted value with
         # {"code":4001,"message":"bad request: binding: expr_path=app_version_code,
         #  cause=parameter type does not match binding data"}.
-        appVersionCode: 20260401
+        # The gateway grades this by numeric magnitude: 20260401→42 rows,
+        # 20260701→46 rows, >=20260901→57 rows (full catalog → 20 chat models).
+        appVersionCode: 20260901
         # x-ide-version; empty means detect it from the local Trae install.
         ideVersion: ''
         displayName: 'Trae CN'

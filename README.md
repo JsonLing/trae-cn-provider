@@ -113,7 +113,7 @@ https://www.trae.cn/authorization?...&auth_callback_url=http://127.0.0.1:<port>/
     credentialSource: oauth      # oauth | local | auto
     edition: cn                  # local/auto 时读哪个 edition
     requestStyle: chat_v3        # chat_v3（实测可用）| inline_chat（实验，实测失败）
-    appVersionCode: 20260401     # 必须是纯整数，见下方说明
+    appVersionCode: 20260901     # 必须是纯整数，见下方说明
     ideVersion: ''               # 留空 = 从本机 Trae 安装读取
     displayName: Trae CN
     loginCommand: trae-login
@@ -123,7 +123,15 @@ https://www.trae.cn/authorization?...&auth_callback_url=http://127.0.0.1:<port>/
 
 `appVersionCode` 会作为 `x-app-version-code` / `x-ide-version-code` 发送。**它必须是纯整数**：带点的值（例如 `2.3.90452`）会被上游以
 `bad request: binding: expr_path=app_version_code, cause=parameter type does not match binding data` 拒绝。
-而且**该值决定网关加载哪套 function 配置** —— 太小（如 `20250325`）会报 `no function config found`。
+而且**网关按该值的数值大小做灰度**，值越小返回的 function 配置越少。实测阈值：
+
+| 取值 | 目录条目 | 过滤后可聊天模型 |
+|---|---|---|
+| `20260401` | 42 | 7 |
+| `20260701` | 46 | — |
+| **`>= 20260901`** | **57** | **20（完整目录）** |
+
+默认值已取 `20260901`，无需手工配置即可看到全部模型。本机 `product.json` 的 `traeVersionCode`（`20250325`）偏旧，`detectEnv()` 只会取「不比基准旧」的值。
 
 ---
 
@@ -150,19 +158,36 @@ node src/cli.js chat "你好"
 
 ## 可用模型
 
-模型目录是从上游实时拉取的，不在代码里硬编码。本机实测（2026-10）过滤后 7 个用户可选模型：
+模型目录是从上游实时拉取的，不在代码里硬编码。本机实测（2026-10）过滤后 **20 个**用户可选模型：
 
-| config_name | 显示名 | 上下文 | 思考档位 |
-|---|---|---|---|
-| `Doubao-Seed-Code` | Seed-Code | 256000 | `light` / `high` |
-| `glm-5.2` | GLM-5.2 | 116000 | — |
-| `DeepSeek-V4-Flash-Official` | DeepSeek-V4-Flash | 116000 | — |
-| `DeepSeek-V4-Pro-Official` | DeepSeek-V4-Pro 正式版 | 116000 | — |
-| `DeepSeek-V4-Pro` | DeepSeek-V4-Pro | 116000 | — |
-| `minimax-m3` | MiniMax-M3 | 116000 | — |
-| `qwen-3.7-plus` | Qwen3.7-Plus | 200000 | — |
+| config_name | 显示名 | 思考档位 |
+|---|---|---|
+| `Doubao-Seed-Evolving` | Seed-Evolving | yes |
+| `Doubao-Seed-2.1-Pro` | Seed-2.1-Pro-0915 | `light` / `high` |
+| `Doubao-Seed-2.1-Turbo` | Seed-2.1-Turbo | `light` / `high` |
+| `Doubao-Seed-Code` | Seed-Code | `light` / `high` |
+| `mimo-v2.6-flash` | MiMo-V2.6-Flash | yes |
+| `mimo-v2.6-pro` | MiMo-V2.6-Pro | yes |
+| `step-5-preview` | Step-5-Preview | `light` / `high` |
+| `glm-5.3-flashx` | GLM-5.3-FlashX | `light` / `high` / `extra_high` |
+| `glm-5.3-flash` | GLM-5.3-Flash | `light` / `high` / `extra_high` |
+| `glm-5.3` | GLM-5.3 | `light` / `high` / `extra_high` |
+| `glm-5.2` | GLM-5.2 | `high` / `extra_high` |
+| `deepseek-v4.1-flash` | DeepSeek-V4-Flash 正式版 | `light` / `high` / `extra_high` |
+| `DeepSeek-V4-Flash-Official` | DeepSeek-V4-Flash | `light` / `high` / `extra_high` |
+| `DeepSeek-V4-Pro-Official` | DeepSeek-V4-Pro | `light` / `high` / `extra_high` |
+| `kimi-k3` | Kimi-K3 | `light` / `high` / `extra_high` |
+| `kimi-k2.8-preview` | Kimi-K2.8-Preview | `light` / `high` / `extra_high` |
+| `minimax-m3` | MiniMax-M3 | — |
+| `qwen3.8-flash` | Qwen3.8-Flash | `light` / `high` / `extra_high` |
+| `qwen3.8-max` | Qwen3.8-Max | `light` / `high` / `extra_high` |
+| `qwen-3.7-plus` | Qwen3.7-Plus | — |
 
-目录里还有 `summary` / `fast_apply` / `title_generation` / `input_optimization` / `custom_model_*` 等条目，它们是内部节点或自定义连接，已按 `usage` 字段过滤掉。
+目录共 57 条，其余条目（`custom_model_*` 占位、内部工具模型、`is_invisible_to_user` 的旧条目）不是可用的聊天模型，已按上游标记过滤掉 —— 放宽过滤**不会**多出可用模型，只会多出噪音。
+
+> **两个决定目录大小的独立维度**（缺一不可，只改一个会静默停在旧目录）：
+> 1. `appVersionCode` 的**数值大小**（灰度阈值，见上文）。
+> 2. 登录设备的 `DeviceName` —— 留成 `TraeProxy` 会被上游识别为非真客户端，只回 2 条 trial 兜底目录。现已默认取本机短主机名，可用 `TRAE_PROXY_DEVICE_NAME` 覆盖。
 
 ---
 
@@ -194,7 +219,7 @@ node src/cli.js chat "你好"
 
 | 能力 | 结果 |
 |---|---|
-| 模型目录 `get_detail_param` | 200，250KB / 42 条 config → 过滤后 7 个用户模型 |
+| 模型目录 `get_detail_param` | 200，57 条 config → 过滤后 20 个用户模型（`appVersionCode >= 20260901`） |
 | 流式对话 `llm_utils_chat` | 正文 + `reasoning_content` 增量正常 |
 | usage | 平铺字段正常，**prompt cache 生效**（实测 `cached_tokens: 128`） |
 | 原生 function calling | 完整 `tool_calls`：`get_weather {"city":"北京"}` |
@@ -204,8 +229,8 @@ node src/cli.js chat "你好"
 | 本机凭据 `tc` 解密 | `cn`（加密）/ `sg`（明文）两种格式均解出并调通上游 |
 | token 刷新 | OAuth 与 local **两条来源都曾刷新成功**（走账号自己的 host、双信封解析）。**注意 refresh token 会被作废**，见下方「refresh token 会失效」 |
 | 过期触发刷新链路 | `test/live-refresh.js` 用隔离的凭据副本把 `expiresAt` 强制到过去，验证「过期 → 自动刷新 → 请求成功 → 新 token 落盘」；当前该凭据的 refresh token 已失效，**需要重新登录后本项才能通过**（脚本会明确诊断，不会让你误以为插件坏了） |
-| adapter 端到端 | `listModels` 7 个 / `resolveModel` 上下文正确 / `stream` 正文+思考+usage+工具调用 |
-| 跨 DSH 版本 | 在 **0.1.2-rc.1**、**0.2.0-rc.2**、**0.2.1-alpha.2** 三个宿主上分别启动并验证：provider 注册、7 个模型、`resolveModelInfo`、挂载接口（health / models / 对话）全部通过。后两个分别对应桌面应用打包的版本与 npm 上的最新版 |
+| adapter 端到端 | `listModels` 20 个 / `resolveModel` 上下文正确 / `stream` 正文+思考+usage+工具调用 |
+| 跨 DSH 版本 | 在 **0.1.2-rc.1**、**0.2.0-rc.2**、**0.2.1-alpha.2** 三个宿主上分别启动并验证：provider 注册、`resolveModelInfo`、挂载接口（health / models / 对话）全部通过。后两个分别对应桌面应用打包的版本与 npm 上的最新版 |
 
 **企业版账号的两个坑**（同类项目基本没处理，会导致刷新永远失败）：
 
@@ -468,8 +493,32 @@ npx -p @jieai/dsh-plugin-vet vet-gate --package node_modules/trae-cn-provider
 - `npm pack` 的产物里包含 `cordis.patch.yml`（否则装上也白装）
 - 从 tarball 安装一次并启动确认（见「开发」一节的验证方法）
 - 版本号已更新；`private` 不是 `true`
-- **补齐包元数据**：`author` / `repository` / `homepage` / `bugs` 目前都是空的。
-  这里**故意没有填占位值** —— 编造的仓库地址比留空更糟。发布前请填上你真实的仓库地址（npm 不会为此报警，但它是别人评估「这个包可不可信」时最先看的东西之一；同类项目里就有因为 `repository` 为空而被质疑的例子）。
+- 包元数据（`author` / `repository` / `homepage` / `bugs`）已填写 —— 别人评估「这个包可不可信」时最先看的就是它们。
+
+---
+
+## 让别的 agent 框架也用上（以 Hermes 为例）
+
+`mountOpenAIEndpoint` 挂出的 `/trae-cn/v1` 是一个**标准 OpenAI 兼容端点**，所以任何支持自定义 OpenAI 端点的框架都能直接接入，**不需要改插件、也不需要第二次登录**。
+
+以 [Hermes](https://github.com/NousResearch/hermes)（本机实测）为例，在 `~/.hermes/config.yaml` 加：
+
+```yaml
+providers:
+  trae:
+    base_url: "http://127.0.0.1:19387/trae-cn/v1"
+    api_key: "trae-local"        # 端点仅监听 127.0.0.1 且无鉴权，非空即可
+    default_model: "glm-5.3"
+```
+
+再 `hermes config set model.provider trae`。实测：Hermes 把它解析为 `provider: custom` / `api_mode: chat_completions`，20 个模型全部可见，流式 / 非流式 / function calling 均可用。
+
+两个前提：
+
+- **凭据只有一份。** 消费方（Hermes）只是 HTTP 客户端，不持有 Trae 凭据；登录与刷新全部由本插件负责。DSH 里 `/trae-login` 一次，两边同时可用。
+- **该端点依赖 DSH 进程存活。** 想脱离 DSH 就改用独立进程：`node src/cli.js serve --port 8317`（同样实测 20 个模型可用），配 LaunchAgent 常驻。
+
+> 顺带说明：**别指望直接读 Trae 客户端的登录态**（`credentialSource: local`）。新版 Trae CN 已把 `storage.json` 里的键名改为动态拼接的 `iCubeAuthInfo://icube-dc:<authProviderId>`，且该键解出来**只有设备密钥对、没有 token** —— 登录态迁到了 `state.vscdb`，那里也不存 token。`local` 因此在新版 CN 上读不到东西，属正常现象，用默认的 `oauth`。
 
 ---
 
@@ -485,7 +534,8 @@ npx -p @jieai/dsh-plugin-vet vet-gate --package node_modules/trae-cn-provider
 | 打包成 DSH bundle 插件 | ✅ 从 tarball 安装并启动验证 |
 | 在本机验证可用 | ✅ 在 DSH **0.1.2-rc.1** 与 **0.2.0-rc.2** 上分别验证 provider 注册与调用 |
 | `prepareCall().stream()` 适配 0.2.0-rc.2 的同步解引用 | ✅ `streamPrepared` async generator + 回归测试（0.1.3） |
-| 走通发布流程 | ⚠️ `npm pack` 与 `npm publish --dry-run` 均已通过；**实际 `npm publish` 需要账号持有者执行**（DSH 没有官方市场，分发渠道就是 npm） |
+| 完整模型目录（20 个而非 7 个） | ✅ 三处版本码统一到 `20260901` + `DeviceName` 对齐真客户端（0.1.4） |
+| 走通发布流程 | ✅ `0.1.0`–`0.1.3` 已发布到 npm；`dsh.so` 收录见上节 |
 
 因此剩余步骤只有两个，且都**必须由账号持有者本人操作**：
 

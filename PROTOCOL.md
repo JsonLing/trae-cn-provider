@@ -168,18 +168,30 @@ Trae CN 的 IDE 进程在 `127.0.0.1:51000` 暴露 **gRPC over h2c**，且在传
 
 以上 §1–§7 来自参考实现源码。以下是**用真实凭据实测后必须修正/补充**的部分。
 
-## A. 请求头：version code 必须是纯数字
+## A. 请求头：version code 必须是纯数字，且按数值大小灰度
 
 ```
-x-app-version-code: 20260401      # 必须整数
-x-ide-version-code: 20260401      # 必须整数
+x-app-version-code: 20260901      # 必须整数
+x-ide-version-code: 20260901      # 必须整数
 x-ide-version: 3.4.1              # product.json 的 appVersion
 ```
 
 - 传 `product.json` 的 `tronBuildVersion`（`"2.3.90452"`，带点）→ 400：
   `{"code":4001,"message":"bad request: binding: expr_path=app_version_code, cause=parameter type does not match binding data"}`
-- **该值同时决定网关加载哪套 function 配置**：`20250101` / `20250325` → `no function config found for appId=..., function=inline_chat`；`>= 20260401` 正常。
-- Trae 自己的 `main.js` 里 **没有** `app-version-code` 字样（0 处命中），最接近的是 `productService.traeVersionCode`（本机 `20250325`，但已偏旧）。故取「本机值若不比基准旧则用本机值，否则用基准 `20260401`」。
+- **该值同时决定网关加载哪套 function 配置**：`20250101` / `20250325` → `no function config found for appId=..., function=inline_chat`。
+- **网关按数值的单调大小做灰度**（实测同一账号、同一凭据，只改这一个头）：
+
+  | 取值 | `config_info_list` 条目 | 过滤后可聊天模型 |
+  |---|---|---|
+  | `20260401` | 42 | 7 |
+  | `20260701` | 46 | — |
+  | `20260901` | **57** | **20** |
+  | `23090452` | 57（平台期） | 20 |
+
+  即 **`>= 20260901` 解锁完整目录**，再往上不再增长。
+- 目录响应的 `config_info_list` 在**顶层**（没有 `data` 包裹）；`trae-client.js` 两种形态都兼容，写探针时必须同样兼容，否则会把 42/57 条误读成 0 条。
+- Trae 自己的 `main.js` 里 **没有** `app-version-code` 字样（0 处命中），最接近的是 `productService.traeVersionCode`（本机 `20250325`，但已偏旧）。故取「本机值若不比基准旧则用本机值，否则用基准」。
+- **第二个独立维度：`DeviceName`。** 留成 `TraeProxy` 会被上游识别为非真客户端，只回 2 条 `fast_apply` trial 兜底目录。真客户端填的是本机短主机名，必须对齐（见 `src/trae-auth.js` 的 `createDevice`）。
 
 ## B. 聊天请求体：正确的字段组合（已实测通过）
 
@@ -218,17 +230,32 @@ x-ide-version: 3.4.1              # product.json 的 appVersion
 5. 每个 config 的 `model_detail_list` 只有 1 条，字段很少：
    `model_name / prompt_max_tokens / max_tokens / max_turn / tool_call_history_max_tokens / encrypted_model_params / model_extra_config / icon / model_entitlement_usage_cost`。
 
-过滤后本机可用模型（7 个）：
+过滤后本机可用模型（**20 个**，需 `appVersionCode >= 20260901`）：
 
-| config_name | 显示名 | 上下文 | 档位 |
-|---|---|---|---|
-| `Doubao-Seed-Code` | Seed-Code | 256000 | light/high |
-| `glm-5.2` | GLM-5.2 | 116000 | - |
-| `DeepSeek-V4-Flash-Official` | DeepSeek-V4-Flash | 116000 | - |
-| `DeepSeek-V4-Pro-Official` | DeepSeek-V4-Pro 正式版 | 116000 | - |
-| `DeepSeek-V4-Pro` | DeepSeek-V4-Pro | 116000 | - |
-| `minimax-m3` | MiniMax-M3 | 116000 | - |
-| `qwen-3.7-plus` | Qwen3.7-Plus | 200000 | - |
+| config_name | 显示名 | 档位 |
+|---|---|---|
+| `Doubao-Seed-Evolving` | Seed-Evolving | yes |
+| `Doubao-Seed-2.1-Pro` | Seed-2.1-Pro-0915 | light/high |
+| `Doubao-Seed-2.1-Turbo` | Seed-2.1-Turbo | light/high |
+| `Doubao-Seed-Code` | Seed-Code | light/high |
+| `mimo-v2.6-flash` | MiMo-V2.6-Flash | yes |
+| `mimo-v2.6-pro` | MiMo-V2.6-Pro | yes |
+| `step-5-preview` | Step-5-Preview | light/high |
+| `glm-5.3-flashx` | GLM-5.3-FlashX | light/high/extra_high |
+| `glm-5.3-flash` | GLM-5.3-Flash | light/high/extra_high |
+| `glm-5.3` | GLM-5.3 | light/high/extra_high |
+| `glm-5.2` | GLM-5.2 | high/extra_high |
+| `deepseek-v4.1-flash` | DeepSeek-V4-Flash 正式版 | light/high/extra_high |
+| `DeepSeek-V4-Flash-Official` | DeepSeek-V4-Flash | light/high/extra_high |
+| `DeepSeek-V4-Pro-Official` | DeepSeek-V4-Pro | light/high/extra_high |
+| `kimi-k3` | Kimi-K3 | light/high/extra_high |
+| `kimi-k2.8-preview` | Kimi-K2.8-Preview | light/high/extra_high |
+| `minimax-m3` | MiniMax-M3 | - |
+| `qwen3.8-flash` | Qwen3.8-Flash | light/high/extra_high |
+| `qwen3.8-max` | Qwen3.8-Max | light/high/extra_high |
+| `qwen-3.7-plus` | Qwen3.7-Plus | - |
+
+全量 57 条里的其余条目是 `custom_model_*` 占位、内部工具模型（`summary` / `fast_apply` / `title_generation` / `input_optimization`）与 `is_invisible_to_user` 的旧条目 —— **放宽过滤不会得到可用聊天模型**。
 
 ## D. 网页登录回调的真实形态（**与参考实现的 authCodeInfo 完全不同**）
 
@@ -253,7 +280,7 @@ POST https://api.trae.cn/cloudide/api/v3/trae/oauth/ExchangeToken
 
 | 能力 | 结果 |
 |---|---|
-| 模型目录 `get_detail_param` | 200，250KB，42 条 config → 过滤后 7 个用户模型 |
+| 模型目录 `get_detail_param` | 200，57 条 config → 过滤后 20 个用户模型 |
 | 流式对话 `llm_utils_chat` | 正文 + `reasoning_content` 增量正常 |
 | `token_usage` | 平铺字段正常，**`cached_tokens` 生效**（实测 128） |
 | 原生 function calling | 返回完整 `tool_calls`：`get_weather {"city":"北京"}` |
@@ -336,7 +363,7 @@ SG（9 键）：同上 **外加 `host`**（SG 实测 `https://api-sg-central.tra
 | `cn` | tc | 429404416 | 1124 | 2026-10-26 |
 | `sg` | 明文 | 7529754484382434312 | 1008 | 2026-02-23 |
 
-**端到端验证**：用 `cn` 解出的凭据调用上游 → 模型目录 7 个、对话返回正文与 usage ✅
+**端到端验证**：用 `cn` 解出的凭据调用上游 → 模型目录 20 个、对话返回正文与 usage ✅
 
 实现见 `src/trae-local-credentials.js`，可用 `readLocalCredentials(edition)` / `readAnyLocalCredentials()` / `discoverEditions()`。
 
@@ -394,8 +421,8 @@ Data.TokenExpireDuration = 1209600000   (14 天)
 
 | 来源 | 刷新 | 刷新所得 token 调上游 |
 |---|---|---|
-| 网页登录 OAuth | ✓ | ✓ 模型目录 7 个 |
-| 本机凭据（tc 解密） | ✓ | ✓ 模型目录 7 个 |
+| 网页登录 OAuth | ✓ | ✓ 模型目录 20 个 |
+| 本机凭据（tc 解密） | ✓ | ✓ 模型目录 20 个 |
 
 refresh token **不是一次性**的：重复刷新返回同一枚新 refreshToken。
 刷新后必须把新的 `Token` / `RefreshToken` / 过期时间**持久化回写**，否则会一直用旧值。

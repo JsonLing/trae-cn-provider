@@ -25,7 +25,12 @@ export function createDevice(ideVersion) {
     MachineID: crypto.createHash('sha512').update(crypto.randomUUID()).digest('hex'),
     PlatformCode: 'IDE_PC',
     DeviceType: 'PC',
-    DeviceName: 'TraeProxy',
+    // DeviceName 留 "TraeProxy" 会被上游识别为非真客户端 — 它只回
+    // trial 兜底目录（2 条 fast_apply），真实 25+ 模型看不到。
+    // Trae 真客户端这里填的是本机短主机名，我们也对齐。
+    // 允许 TRAE_PROXY_DEVICE_NAME 覆盖（自定一个跨主机稳定名）。
+    DeviceName: process.env.TRAE_PROXY_DEVICE_NAME
+      || (os.hostname().split('.')[0] || 'TraeProxy'),
     DeviceModel: '',
     DeviceBrand: '',
     DeviceCPU: '',
