@@ -125,9 +125,29 @@ await test('the login command registers and drives the browser flow', async () =
     assertEqual(saved.token, jwt.Token, 'access token persisted');
     assertEqual(saved.userId, '429404416', 'user id persisted');
     assert(JSON.stringify(saved).indexOf(SCRATCH) === -1, 'no scratch path leaked into the credential');
+
+    // The callback query carries `userJwt` (Token + RefreshToken) and a bare
+    // `refreshToken`; the debug log may keep the diagnostic shape, never the
+    // secrets (dsh.so dynamic-audit finding, 0.1.6).
+    const debugLog = fs.readFileSync(path.join(SCRATCH, '.trae-proxy', 'login-debug.log'), 'utf8');
+    assert(debugLog.includes('userJwt=<redacted'), 'debug log keeps the callback key shape');
+    assert(!debugLog.includes(jwt.Token), 'access token not written to the debug log');
+    assert(!debugLog.includes(jwt.RefreshToken), 'refresh token not written to the debug log');
+    assert(!debugLog.includes('UserInfo'), 'userInfo payload not written verbatim');
   } finally {
     mock.restore();
   }
+});
+
+await test('redactSearch keeps key names and drops secret values', async () => {
+  const { redactSearch } = await import('../src/trae-auth.js');
+  const redacted = redactSearch('?scope=saas&userJwt=secret.jwt.value&refreshToken=abc123&state=a-b-c');
+  assert(redacted.includes('scope=saas'), `non-secret value kept, got ${redacted}`);
+  assert(redacted.includes('state=a-b-c'), `non-secret short value kept, got ${redacted}`);
+  assert(redacted.includes('userJwt=<redacted 16>'), `jwt redacted with its length, got ${redacted}`);
+  assert(redacted.includes('refreshToken=<redacted 6>'), `refresh token redacted, got ${redacted}`);
+  assert(!redacted.includes('secret.jwt.value'), 'no jwt material survives');
+  assertEqual(redactSearch(''), '', 'empty query stays empty');
 });
 
 await test('a host without the commands service degrades instead of failing', async () => {

@@ -48,6 +48,36 @@ project's own homepage, used inside a `user-agent` string — the attribution
 shape DSH itself mandates for every provider request. It is not contacted and no
 data is sent to it.
 
+## The local OpenAI-compatible surface
+
+`mountOpenAIEndpoint` (and `node src/cli.js serve`) expose an OpenAI-shaped
+endpoint on loopback. It is **unauthenticated by default** — the assumption is
+that only processes on this machine can reach it — but that assumption is wrong
+for browsers: *any* page you have open can POST to `127.0.0.1`, and a permissive
+CORS header would let it read the answer back and spend your Trae quota.
+
+So the surface is locked down in two ways:
+
+- **No `Access-Control-Allow-Origin: *`.** A request that carries an `Origin`
+  header is answered `403` unless its origin is listed in
+  `allowBrowserOrigins` (default: empty). Agent/SDK clients — Hermes,
+  `openai-python`, `curl` — send no `Origin` and are unaffected.
+- **`apiKey`** can be set for the standalone server (`serve --api-key`), which
+  then requires `Authorization: Bearer …` or `X-API-Key` on `/v1/*`.
+
+Both are opt-in hardening on top of the loopback binding; neither claims to
+sandbox the endpoint from other local processes, which can always connect.
+
+## Nothing secret is written to the debug log
+
+`~/.trae-proxy/login-debug.log` exists to diagnose unrecognised OAuth callbacks.
+Trae's callback query carries `userJwt` (which itself contains `Token` and
+`RefreshToken`), so the raw query is **not** what gets written: sensitive keys
+(anything matching token/jwt/code/ticket/session/auth/key/sig/credential/userinfo)
+are replaced with `<redacted N>`, and other long values are truncated. The log
+keeps the parameter *shape* and nothing else. `test/smoke-login.js` asserts that
+neither the access token nor the refresh token appears in the file.
+
 ## Process execution
 
 `child_process.spawn` appears in exactly one role: opening the authorization URL

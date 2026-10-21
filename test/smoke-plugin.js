@@ -266,9 +266,29 @@ await test('the mounted surface answers /trae-cn/v1/models and a chat completion
 
       const listed = await realFetch(`${base}/trae-cn/v1/models`);
       assertEqual(listed.status, 200, 'models status');
+      // No blanket CORS grant: a page must not be able to read this surface.
+      assertEqual(listed.headers.get('access-control-allow-origin'), null, 'no wildcard Access-Control-Allow-Origin');
       const body = await listed.json();
       assertEqual(body.data.length, 1, 'models listed');
       assertEqual(body.data[0].id, 'glm-5.2', 'model id');
+
+      // A browser-originated request would spend the signed-in user's Trae quota,
+      // so it is refused before any upstream call. `sawBody` staying null above
+      // and below proves nothing reached the provider.
+      const crossOrigin = await realFetch(`${base}/trae-cn/v1/models`, {
+        headers: { Origin: 'https://evil.example' },
+      });
+      assertEqual(crossOrigin.status, 403, 'cross-origin request refused');
+      assertEqual(crossOrigin.headers.get('access-control-allow-origin'), null, 'refusal carries no CORS grant');
+      const refusal = await crossOrigin.json();
+      assertEqual(refusal.error.type, 'permission_error', 'refusal type');
+
+      const crossOriginChat = await realFetch(`${base}/trae-cn/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+        body: JSON.stringify({ model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }], stream: false }),
+      });
+      assertEqual(crossOriginChat.status, 403, 'cross-origin chat refused');
 
       const chat = await realFetch(`${base}/trae-cn/v1/chat/completions`, {
         method: 'POST',
@@ -287,6 +307,26 @@ await test('the mounted surface answers /trae-cn/v1/models and a chat completion
     }
   } finally {
     mock.restore();
+  }
+});
+
+await test('allowBrowserOrigins admits only the origins it lists', async () => {
+  const realFetch = globalThis.fetch;
+  const { createServer } = await import('../src/openai-server.js');
+  const provider = { ready: true, env: { source: 'test' }, models: async () => [], logger: {} };
+  const server = createServer(provider, { allowOrigins: ['https://ok.example'] });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const allowed = await realFetch(`${base}/v1/models`, { headers: { Origin: 'https://ok.example' } });
+    assertEqual(allowed.status, 200, 'listed origin passes');
+    assertEqual(allowed.headers.get('access-control-allow-origin'), 'https://ok.example', 'echoes the listed origin');
+    assertEqual(allowed.headers.get('vary'), 'Origin', 'Vary: Origin on an allowed reply');
+
+    const other = await realFetch(`${base}/v1/models`, { headers: { Origin: 'https://other.example' } });
+    assertEqual(other.status, 403, 'unlisted origin still refused');
+  } finally {
+    server.close();
   }
 });
 

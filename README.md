@@ -119,7 +119,12 @@ https://www.trae.cn/authorization?...&auth_callback_url=http://127.0.0.1:<port>/
     loginCommand: trae-login
     mountOpenAIEndpoint: true
     openAIPath: /trae-cn        # 挂载前缀（不是 base URL）：对外接口为 /trae-cn/v1/...
+    allowBrowserOrigins: []     # 默认 []：带 Origin 头的浏览器请求一律 403
 ```
+
+`allowBrowserOrigins` 是**安全默认**：该端点花的是你自己账号的 Trae 额度，而任何网页都能向 `127.0.0.1`
+发请求，所以默认拒绝所有带 `Origin` 头的请求。Hermes、`openai-python`、`curl` 这类服务端客户端不发
+`Origin`，不受影响；确实需要浏览器直连时，把来源（例如 `https://my-tool.local`）加进这个列表。
 
 `appVersionCode` 会作为 `x-app-version-code` / `x-ide-version-code` 发送。**它必须是纯整数**：带点的值（例如 `2.3.90452`）会被上游以
 `bad request: binding: expr_path=app_version_code, cause=parameter type does not match binding data` 拒绝。
@@ -153,6 +158,11 @@ node src/cli.js models    # 列出模型
 node src/cli.js serve --port 8317 [--api-key <key>]   # → http://127.0.0.1:8317/v1
 node src/cli.js chat "你好"
 ```
+
+> **浏览器来源默认被拒绝。** 以前这里无条件回 `Access-Control-Allow-Origin: *`，意味着你浏览器里
+> 任意一个页面都能对 `127.0.0.1` 上的这个端点发请求，用你的 Trae 登录态和额度跑模型。从 0.1.6 起，
+> 带 `Origin` 头的请求直接回 `403`，除非来源被加进 `allowBrowserOrigins`。服务端客户端（Hermes、
+> `openai-python`、`curl`）不发 `Origin`，行为不变。
 
 ---
 
@@ -642,7 +652,8 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
-| **0.1.5** | 文档为主：新增「让别的 agent 框架也用上（以 Hermes 为例）」的完整接法与排错 —— DSH 宿主端口每次启动都会变、桌面端输入框的模型选择是粘性的、`fallback_providers` 必须是 YAML 列表（写成 JSON 字符串会被静默忽略）；补 LaunchAgent 常驻写法。运行时行为与 0.1.4 一致 |
+| **0.1.6** | 安全加固，来自 dsh.so 动态审计的两条发现：① `/v1` 默认不再下发 `Access-Control-Allow-Origin: *`，带 `Origin` 头的请求一律 `403`（新增 `allowBrowserOrigins` 白名单）—— 以前任意网页都能用你的 Trae 额度；② `login-debug.log` 落盘前对回调参数脱敏，`userJwt` / `refreshToken` / `userInfo` 等敏感值替换成 `<redacted N>` —— 以前令牌会被复制到凭据文件之外。两条都有回归测试锁住 |
+| 0.1.5 | 文档为主：新增「让别的 agent 框架也用上（以 Hermes 为例）」的完整接法与排错 —— DSH 宿主端口每次启动都会变、桌面端输入框的模型选择是粘性的、`fallback_providers` 必须是 YAML 列表（写成 JSON 字符串会被静默忽略）；补 LaunchAgent 常驻写法。运行时行为与 0.1.4 一致 |
 | 0.1.4 | 模型目录 7 → 20：三处版本码统一到 `20260901`，`DeviceName` 对齐真客户端 |
 | 0.1.3 | `prepareCall().stream()` 改为同步返回 `AsyncIterable`（修 0.2.0-rc.2 上每次调用即失败） |
 | 0.1.2 | `/trae-login` 的返回值改成宿主 `CommandResult` 接受的形状（以前登录成功却在返回时抛错） |

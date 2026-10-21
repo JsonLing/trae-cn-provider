@@ -198,6 +198,29 @@ function dumpCallback(record) {
   }
 }
 
+// 回调 query 带着 userJwt（内含 Token / RefreshToken）与 userInfo，原样落盘等于
+// 把凭据复制到 credentials.json 之外。诊断只需要「参数长什么样」，不需要密码
+// 本身 —— 所以敏感键一律替换成 `<redacted N>`，非敏感长值也截断。
+const SECRET_KEY = /(token|jwt|secret|password|passwd|code|ticket|session|auth|key|sig|credential|userinfo)/i;
+
+/** Redact an OAuth callback query string before it reaches the debug log. */
+export function redactSearch(search) {
+  const raw = String(search ?? '');
+  if (!raw) return '';
+  const params = new URLSearchParams(raw.startsWith('?') ? raw.slice(1) : raw);
+  const parts = [];
+  for (const [key, value] of params) {
+    if (SECRET_KEY.test(key)) {
+      parts.push(`${key}=<redacted ${value.length}>`);
+    } else if (value.length > 32) {
+      parts.push(`${key}=${value.slice(0, 8)}…(${value.length})`);
+    } else {
+      parts.push(`${key}=${value}`);
+    }
+  }
+  return parts.length ? `?${parts.join('&')}` : '';
+}
+
 /**
  * 走网页登录拿凭据。
  * @param {object} opts
@@ -245,13 +268,13 @@ export async function webLogin({ ideVersion, onAuthorizeUrl, onProgress, timeout
         res.end(`<meta charset="utf-8"><h1>${message}</h1>`);
       };
       if (req.method !== 'GET' || url.pathname !== '/authorize') {
-        dumpCallback({ kind: 'unexpected', method: req.method, path: url.pathname, search: url.search });
+        dumpCallback({ kind: 'unexpected', method: req.method, path: url.pathname, search: redactSearch(url.search) });
         return respond(400, 'Invalid callback');
       }
 
       const parsed = parseCallback(url.search);
       const keys = [...url.searchParams.keys()];
-      dumpCallback({ kind: 'callback', strategy: parsed.strategy ?? parsed.kind, found: parsed.kind !== 'unknown', keys, search: url.search });
+      dumpCallback({ kind: 'callback', strategy: parsed.strategy ?? parsed.kind, found: parsed.kind !== 'unknown', keys, search: redactSearch(url.search) });
 
       if (parsed.kind === 'unknown') {
         // 不结束登录：用户可以直接刷新授权页重试

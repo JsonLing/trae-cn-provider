@@ -182,12 +182,32 @@ async function readBody(req, limit = 32 * 1024 * 1024) {
  * to hand the `http.Server` instance to `webServer.register()`, which is not
  * callable, so every request died as an opaque 400.
  */
-export function createRequestHandler(provider, { apiKey = null } = {}) {
+export function createRequestHandler(provider, { apiKey = null, allowOrigins = [] } = {}) {
+  const browserOrigins = new Set(
+    (Array.isArray(allowOrigins) ? allowOrigins : []).map((value) => String(value ?? '').trim()).filter(Boolean),
+  );
   return async function handleRequest(req, res) {
     const url = new URL(req.url, 'http://localhost');
     const path = url.pathname;
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // 不再无条件下发 `Access-Control-Allow-Origin: *`。这个端点只能从挂载它的
+    // 那台机器访问，但任何网页都能对 loopback 发请求 —— 而它花的是用户自己的
+    // Trae 额度。所以带 `Origin` 头的请求一律拒绝，除非来源被显式允许。
+    // Hermes / openai-python / curl 这类服务端客户端不发送 Origin，默认不受影响。
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+    if (origin) {
+      if (!browserOrigins.has(origin)) {
+        return sendError(
+          res,
+          403,
+          `拒绝浏览器来源的请求（Origin: ${origin}）。此端点面向本机 agent / SDK，会消耗你自己的 Trae 额度；确需浏览器直连，请把来源加入 allowBrowserOrigins。`,
+          'permission_error',
+        );
+      }
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
+
     if (req.method === 'OPTIONS') {
       res.writeHead(204, { 'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-API-Key', 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS' });
       return res.end();
@@ -322,8 +342,8 @@ export function createServer(provider, options = {}) {
   return http.createServer(createRequestHandler(provider, options));
 }
 
-export function startServer(provider, { port = 8317, host = '127.0.0.1', apiKey = null } = {}) {
-  const server = createServer(provider, { apiKey });
+export function startServer(provider, { port = 8317, host = '127.0.0.1', apiKey = null, allowOrigins = [] } = {}) {
+  const server = createServer(provider, { apiKey, allowOrigins });
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, host, () => resolve({ server, url: `http://${host}:${port}` }));
