@@ -145,12 +145,12 @@ https://www.trae.cn/authorization?...&auth_callback_url=http://127.0.0.1:<port>/
 | POST | `/trae-cn/v1/chat/completions` | 对话（流式 / 非流式，含 `reasoning_content` 与 tool calls） |
 | GET | `/trae-cn/health` | 健康检查 |
 
-独立 CLI 也可以把同样的接口跑在自有端口上：
+独立 CLI 也可以把同样的接口跑在自有端口上。注意独立进程的路径**没有** `/trae-cn` 前缀，直接就是 `/v1/...`：
 
 ```bash
 node src/cli.js login     # 浏览器登录
 node src/cli.js models    # 列出模型
-node src/cli.js serve --port 8317 [--api-key <key>]
+node src/cli.js serve --port 8317 [--api-key <key>]   # → http://127.0.0.1:8317/v1
 node src/cli.js chat "你好"
 ```
 
@@ -231,6 +231,7 @@ node src/cli.js chat "你好"
 | 过期触发刷新链路 | `test/live-refresh.js` 用隔离的凭据副本把 `expiresAt` 强制到过去，验证「过期 → 自动刷新 → 请求成功 → 新 token 落盘」；当前该凭据的 refresh token 已失效，**需要重新登录后本项才能通过**（脚本会明确诊断，不会让你误以为插件坏了） |
 | adapter 端到端 | `listModels` 20 个 / `resolveModel` 上下文正确 / `stream` 正文+思考+usage+工具调用 |
 | 跨 DSH 版本 | 在 **0.1.2-rc.1**、**0.2.0-rc.2**、**0.2.1-alpha.2** 三个宿主上分别启动并验证：provider 注册、`resolveModelInfo`、挂载接口（health / models / 对话）全部通过。后两个分别对应桌面应用打包的版本与 npm 上的最新版 |
+| 别的框架直连（Hermes） | 独立进程 `serve --port 8317` 下 20 个模型全部可用；Hermes 侧流式 / 非流式 / function calling 均通过，`-z` 一轮问答正常返回，会话的 `billing_provider` 落在 `trae`。排错细节见「让别的 agent 框架也用上」 |
 
 **企业版账号的两个坑**（同类项目基本没处理，会导致刷新永远失败）：
 
@@ -499,24 +500,119 @@ npx -p @jieai/dsh-plugin-vet vet-gate --package node_modules/trae-cn-provider
 
 ## 让别的 agent 框架也用上（以 Hermes 为例）
 
-`mountOpenAIEndpoint` 挂出的 `/trae-cn/v1` 是一个**标准 OpenAI 兼容端点**，所以任何支持自定义 OpenAI 端点的框架都能直接接入，**不需要改插件、也不需要第二次登录**。
+插件对外提供的是**标准 OpenAI 兼容端点**（`/v1/models` + `/v1/chat/completions`），任何支持自定义 OpenAI 端点的框架都能直接接入，**不需要改插件、也不需要第二次登录**。
 
-以 [Hermes](https://github.com/NousResearch/hermes)（本机实测）为例，在 `~/.hermes/config.yaml` 加：
+它有**两种暴露方式，端口和路径都不一样**，接错是最常见的失败原因：
+
+| 方式 | Base URL | 端口稳定性 |
+|---|---|---|
+| DSH 宿主挂载（`mountOpenAIEndpoint: true`，默认） | `http://127.0.0.1:<DSH Web 端口>/trae-cn/v1` | ❌ DSH 桌面端每次启动都换端口 |
+| 独立进程 `node src/cli.js serve --port 8317` | `http://127.0.0.1:8317/v1` | ✅ 端口固定 |
+
+> ⚠️ **不要照抄具体端口号。** DSH 的 Web 端口是每次启动重新分配的（本机实测：`19387` → `54865` → `50455`，每次重启都换一个，旧端口上不再有进程监听）。同时独立进程的路径里**没有** `/trae-cn` 前缀。写死错的组合时表现就是：Hermes 能启动、模型列表也能看到，但一发消息就失败。
+
+**推荐的接法：用独立进程 + 固定端口。** 它不依赖 DSH 是否在跑，DSH 重启也不受影响：
+
+```bash
+node src/cli.js serve --port 8317          # 常驻，打印 http://127.0.0.1:8317/v1
+curl -s http://127.0.0.1:8317/v1/models | head -c 200   # 自检：应返回 20 个模型
+```
+
+然后改 `~/.hermes/config.yaml`：
 
 ```yaml
+model:
+  provider: trae
+  base_url: "http://127.0.0.1:8317/v1"
+  api_key: "trae-local"        # 端点仅监听 127.0.0.1 且无鉴权，非空即可
+  api_mode: chat_completions
+  default: glm-5.3
+
 providers:
   trae:
-    base_url: "http://127.0.0.1:19387/trae-cn/v1"
-    api_key: "trae-local"        # 端点仅监听 127.0.0.1 且无鉴权，非空即可
+    base_url: "http://127.0.0.1:8317/v1"
+    api_key: "trae-local"
     default_model: "glm-5.3"
 ```
 
-再 `hermes config set model.provider trae`。实测：Hermes 把它解析为 `provider: custom` / `api_mode: chat_completions`，20 个模型全部可见，流式 / 非流式 / function calling 均可用。
+实测：Hermes 把它解析为自定义端点（`api_mode: chat_completions`），20 个模型全部可见，流式 / 非流式 / function calling 均可用。
 
 两个前提：
 
 - **凭据只有一份。** 消费方（Hermes）只是 HTTP 客户端，不持有 Trae 凭据；登录与刷新全部由本插件负责。DSH 里 `/trae-login` 一次，两边同时可用。
-- **该端点依赖 DSH 进程存活。** 想脱离 DSH 就改用独立进程：`node src/cli.js serve --port 8317`（同样实测 20 个模型可用），配 LaunchAgent 常驻。
+- **端点要常驻。** 想脱离 DSH，就用上面的独立进程，并配 LaunchAgent（见本节末尾）。
+
+### 报错对照
+
+| 现象 | 含义 | 处理 |
+|---|---|---|
+| `HTTP 429: Insufficient balance or no resource package`，且 `provider: zai`、`base_url: https://api.z.ai/...` | 请求**根本没走 Trae**，打到了 Z.AI 官方接口（`GLM_API_KEY` 余额不足） | 确认 `model.provider` 是 `trae`；**已有会话会保留自己的 provider/model**，需要新开一个对话，或在输入框的模型选择器里选 trae 分组下的模型 |
+| `ECONNREFUSED 127.0.0.1:<port>`，Hermes 日志出现 `probe-down` | base_url 的端口没有进程监听 | 按上表重新确认端口；DSH 重启后必须换成新端口，或改用固定端口的独立进程 |
+| 模型列表里只有 `zai` 的模型、看不到 `trae` | `providers.trae` 没被读入，或 base_url 连不上导致模型发现失败 | `hermes config get providers.trae`；先 `curl` 自检端点 |
+
+> **模型名会撞车。** Trae 和 Z.AI 都有 `glm-5.2` / `glm-5.3`。只写模型名时，Hermes 可能把 `glm-*` 解析回 Z.AI 的 `zai` provider，于是又变成余额报错。选模型时要选 **trae 分组**下的那个，而不是 `zai` 分组下的同名项。
+
+### 两个容易漏的 Hermes 细节
+
+**1. 桌面端输入框的模型选择是「粘性」的，会盖掉配置文件。** Hermes 把这个选择存在 renderer 的 localStorage（`hermes.desktop.composer.model` / `hermes.desktop.composer.provider`），每次新对话通过 `session.create` 的 client override 发上来，优先级高于 `model:` 段。所以只改 `config.yaml` 不会改变已经在用 zai 的那个输入框 —— 日志会写得很清楚：
+
+```
+session.create 20261019_195633_28685e: model=glm-5.3 provider=zai source=client override (profile default: glm-5.3)
+```
+
+处理：在输入框的模型选择器里点一次 **trae** 分组下的模型即可（选择器里 trae 那一组的 `is_current` 为 true，`api_url` 就是本文档的 `base_url`）。
+
+**2. `fallback_providers` 必须是 YAML 列表，不能是 JSON 字符串。** 写成
+
+```yaml
+fallback_providers: '[{"provider": "trae", "model": "glm-5.3", "base_url": "http://127.0.0.1:8317/v1"}]'
+```
+
+会被**静默忽略**（`hermes_cli/fallback_config.py` 的 `_iter_fallback_entries` 只认 dict/list），日志表现为 `no fallback_chain / fallback_providers is configured`。正确写法：
+
+```yaml
+fallback_providers:
+  - provider: trae
+    model: glm-5.3
+    base_url: http://127.0.0.1:8317/v1
+    api_key: trae-local
+  - provider: deepseek
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com/v1
+```
+
+`billing` 类错误（余额不足的 429）在分类器里带 `should_fallback=True`，所以配好这条链之后，即使某个对话还钉在 zai 上，也会在真正发请求前切到 trae。
+
+### 常驻（macOS LaunchAgent）
+
+`~/Library/LaunchAgents/local.trae-cn-provider.plist`（`node` 换成 `command -v node` 的绝对路径）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.trae-cn-provider</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/path/to/trae-cn-provider/src/cli.js</string>
+    <string>serve</string>
+    <string>--port</string>
+    <string>8317</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/trae-cn-provider.log</string>
+  <key>StandardErrorPath</key><string>/tmp/trae-cn-provider.err.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load -w ~/Library/LaunchAgents/local.trae-cn-provider.plist
+launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state = running
+```
 
 > 顺带说明：**别指望直接读 Trae 客户端的登录态**（`credentialSource: local`）。新版 Trae CN 已把 `storage.json` 里的键名改为动态拼接的 `iCubeAuthInfo://icube-dc:<authProviderId>`，且该键解出来**只有设备密钥对、没有 token** —— 登录态迁到了 `state.vscdb`，那里也不存 token。`local` 因此在新版 CN 上读不到东西，属正常现象，用默认的 `oauth`。
 
@@ -535,12 +631,23 @@ providers:
 | 在本机验证可用 | ✅ 在 DSH **0.1.2-rc.1** 与 **0.2.0-rc.2** 上分别验证 provider 注册与调用 |
 | `prepareCall().stream()` 适配 0.2.0-rc.2 的同步解引用 | ✅ `streamPrepared` async generator + 回归测试（0.1.3） |
 | 完整模型目录（20 个而非 7 个） | ✅ 三处版本码统一到 `20260901` + `DeviceName` 对齐真客户端（0.1.4） |
-| 走通发布流程 | ✅ `0.1.0`–`0.1.3` 已发布到 npm；`dsh.so` 收录见上节 |
+| 走通发布流程 | ✅ `0.1.0`–`0.1.5` 已发布到 npm；`dsh.so` 收录见上节 |
 
 因此剩余步骤只有两个，且都**必须由账号持有者本人操作**：
 
 1. `npm login` 后执行 `npm publish --access public`
 2. 装进日常使用的 profile：先完全退出 DeepSeek Harness 桌面应用，再执行 `dsh plugin --profile desktop add trae-cn-provider`
+
+## 更新日志
+
+| 版本 | 变更 |
+|---|---|
+| **0.1.5** | 文档为主：新增「让别的 agent 框架也用上（以 Hermes 为例）」的完整接法与排错 —— DSH 宿主端口每次启动都会变、桌面端输入框的模型选择是粘性的、`fallback_providers` 必须是 YAML 列表（写成 JSON 字符串会被静默忽略）；补 LaunchAgent 常驻写法。运行时行为与 0.1.4 一致 |
+| 0.1.4 | 模型目录 7 → 20：三处版本码统一到 `20260901`，`DeviceName` 对齐真客户端 |
+| 0.1.3 | `prepareCall().stream()` 改为同步返回 `AsyncIterable`（修 0.2.0-rc.2 上每次调用即失败） |
+| 0.1.2 | `/trae-login` 的返回值改成宿主 `CommandResult` 接受的形状（以前登录成功却在返回时抛错） |
+| 0.1.1 | 租户主机上刷新失败时回退到 cloudide 交换端点 |
+| 0.1.0 | 首个发布版 |
 
 ## 许可
 
