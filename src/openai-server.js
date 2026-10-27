@@ -10,7 +10,14 @@ const CATALOG_TTL_MS = 60 * 60 * 1000;
 const CATALOG_RETRY_MS = 5 * 60 * 1000;
 
 export class TraeProvider {
-  constructor({ env = detectEnv(), credentials = null, logger = console } = {}) {
+  /**
+   * @param {object} [options]
+   * @param {string|null} [options.defaultModel] - what an omitted/`auto` model
+   *   resolves to. Without it the catalog's first entry wins, which is the
+   *   upstream's ordering, not the operator's intent — and that entry is
+   *   `Doubao-Seed-Evolving`, not the DeepSeek model a caller would expect.
+   */
+  constructor({ env = detectEnv(), credentials = null, logger = console, defaultModel = null } = {}) {
     this.env = env;
     this.creds = credentials;
     this.logger = logger;
@@ -18,6 +25,7 @@ export class TraeProvider {
     this.catalogAt = 0;
     this.catalogError = null;
     this.refreshing = null;
+    this.defaultModel = defaultModel ? String(defaultModel) : null;
   }
 
   get ready() {
@@ -81,24 +89,57 @@ export class TraeProvider {
     }
   }
 
+  /**
+   * Look up a catalog entry by any of its names.
+   *
+   * @param {string} [requested] - a `config_name`, `model_name`, display name,
+   *   or a substring of any of them. Omitted / `auto` / `default` resolve to
+   *   the configured default model, then to the catalog's first entry.
+   * @returns {object|null}
+   */
   resolveModel(requested) {
     if (!this.catalog?.length) throw new Error('模型目录尚未加载');
     const want = String(requested || '').trim().toLowerCase();
-    if (!want || want === 'auto' || want === 'default') return this.catalog[0];
-    for (const model of this.catalog) {
-      if (model.configName.toLowerCase() === want) return model;
+    if (!want || want === 'auto' || want === 'default') {
+      if (this.defaultModel) {
+        const configured = matchModel(this.catalog, this.defaultModel.toLowerCase());
+        if (configured) return configured;
+        // The configured name may simply not exist in this account's catalog
+        // (a model withdrawn upstream, or a typo). Fall back rather than fail
+        // every request with a 404 — but say so once, loudly.
+        this.logger.warn?.(
+          `[trae] defaultModel「${this.defaultModel}」不在当前模型目录里，回退到 ${this.catalog[0].configName}`,
+        );
+      }
+      return this.catalog[0];
     }
-    for (const model of this.catalog) {
-      if (model.modelName?.toLowerCase() === want || model.id.toLowerCase() === want) return model;
-    }
-    for (const model of this.catalog) {
-      if (model.name?.toLowerCase() === want) return model;
-    }
-    for (const model of this.catalog) {
-      if (model.configName.toLowerCase().includes(want)) return model;
-    }
-    return null;
+    return matchModel(this.catalog, want);
   }
+}
+
+/**
+ * Find one catalog entry by the four names a caller might use, in order of
+ * specificity: exact `config_name`, then `model_name`/`id`, then display name,
+ * then a substring. Extracted so the default-model path and the explicit-model
+ * path cannot drift apart.
+ * @param {object[]} catalog
+ * @param {string} want - already lowercased.
+ * @returns {object|null}
+ */
+function matchModel(catalog, want) {
+  for (const model of catalog) {
+    if (model.configName?.toLowerCase() === want) return model;
+  }
+  for (const model of catalog) {
+    if (model.modelName?.toLowerCase() === want || model.id?.toLowerCase() === want) return model;
+  }
+  for (const model of catalog) {
+    if (model.name?.toLowerCase() === want) return model;
+  }
+  for (const model of catalog) {
+    if (model.configName?.toLowerCase().includes(want) || model.name?.toLowerCase().includes(want)) return model;
+  }
+  return null;
 }
 
 function buildTraeBody(payload, caps, stream) {

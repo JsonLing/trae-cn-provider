@@ -398,6 +398,37 @@ await test('an upstream 4008 is recorded as an error, not silently dropped', asy
   }
 });
 
+await test('an omitted model resolves to the configured default, not the catalog head', async () => {
+  // The upstream lists Doubao first; an operator who hands out keys wants a
+  // specific model unless the caller says otherwise.
+  const { TraeProvider } = await load('src/openai-server.js');
+  const provider = await makeProvider();
+  provider.catalog = [
+    { configName: 'Doubao-Seed-Evolving', modelName: 'doubao-evo', name: 'Doubao Seed Evolving' },
+    { configName: 'DeepSeek-V4.1-Flash-1017', modelName: 'ds-1017', name: 'DeepSeek V4.1 Flash 1017' },
+  ];
+  provider.defaultModel = 'DeepSeek-V4.1-Flash-1017';
+  assertEqual(provider.resolveModel('auto').configName, 'DeepSeek-V4.1-Flash-1017', 'auto uses the default');
+  assertEqual(provider.resolveModel(undefined).configName, 'DeepSeek-V4.1-Flash-1017', 'omitted uses the default');
+  assertEqual(provider.resolveModel('default').configName, 'DeepSeek-V4.1-Flash-1017', '`default` uses it too');
+  assertEqual(provider.resolveModel('Doubao-Seed-Evolving').configName, 'Doubao-Seed-Evolving', 'an explicit model still wins');
+  assertEqual(provider.resolveModel('deepseek-v4.1-flash-1017').configName, 'DeepSeek-V4.1-Flash-1017', 'case-insensitive');
+  assertEqual(provider.resolveModel('1017').configName, 'DeepSeek-V4.1-Flash-1017', 'substring still resolves');
+  assertEqual(provider.resolveModel('nonexistent'), null, 'unknown names return null');
+
+  // No configured default keeps the historical behaviour: the catalog head.
+  const plain = await makeProvider();
+  assertEqual(plain.resolveModel('auto').configName, 'glm-5.2', 'unset default falls back to the head');
+
+  // A stale default must not 404 every request — fall back and warn.
+  const stale = await makeProvider();
+  stale.logger = { warn: () => {}, error: () => {}, info: () => {} };
+  stale.catalog = [{ configName: 'glm-5.2', modelName: 'glm-5.2__dev', name: 'GLM-5.2' }];
+  stale.defaultModel = 'retired-model';
+  assertEqual(stale.resolveModel('auto').configName, 'glm-5.2', 'a missing default degrades to the head');
+  assertEqual(TraeProvider.length >= 0, true, 'the provider class is importable');
+});
+
 await test('a caller over the daily cap gets 429 before the body is even read', async () => {
   const store = openStore(':memory:');
   const { id } = store.addKey({ key: 'sk-mona-x', label: 'mona', limitTokensPerDay: 10 });

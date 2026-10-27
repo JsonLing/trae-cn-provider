@@ -157,6 +157,10 @@ async function cmdServe() {
   const host = String(flags.host ?? process.env.HOST ?? config.host ?? '127.0.0.1');
   const apiKey = flags['api-key'] ?? process.env.API_KEY ?? config.apiKey ?? null;
   const adminPassword = flags['admin-password'] ?? process.env.ADMIN_PASSWORD ?? config.adminPassword ?? null;
+  // Which model an omitted / `auto` request resolves to. The upstream's own
+  // ordering puts Doubao first, so without this a gateway handed to colleagues
+  // silently answers with a model nobody asked for.
+  const defaultModel = flags['default-model'] ?? process.env.DEFAULT_MODEL ?? config.defaultModel ?? null;
 
   // Gateway mode is opt-in: `--db` (with or without a path) turns on the key
   // table, the daily caps and the usage ledger. Without it `serve` behaves
@@ -197,7 +201,7 @@ async function cmdServe() {
     process.exit(1);
   }
 
-  const provider = new TraeProvider({ credentials: requireCredentials() });
+  const provider = new TraeProvider({ credentials: requireCredentials(), defaultModel });
   // The admin header wants the account balance, which is a networked call. It
   // is cached for five minutes and refreshed in the background: an operator
   // opening the page must never wait on the dashboard endpoint, and a balance a
@@ -247,6 +251,7 @@ async function cmdServe() {
   } else {
     console.log(`  API Key : ${apiKey || '(未设置，仅监听 127.0.0.1)'}`);
   }
+  if (defaultModel) console.log(`  默认模型:   ${defaultModel}（请求不传 model 时使用）`);
   console.log(`  模型目录: http://${shownHost}:${actualPort}/v1/models`);
   try {
     const models = await provider.models();
@@ -620,6 +625,7 @@ async function cmdInit() {
   }
 
   const config = { host, port, db: path.resolve(dbFlag), adminPassword };
+  if (typeof flags['default-model'] === 'string') config.defaultModel = flags['default-model'];
   fs.mkdirSync(path.dirname(configFile), { recursive: true, mode: 0o700 });
   const temp = `${configFile}.${process.pid}.tmp`;
   fs.writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
@@ -683,9 +689,9 @@ if (!commands[command]) {
   console.log('');
   console.log('  login                  浏览器登录 Trae 账号');
   console.log('  models                 列出可用模型');
-  console.log('  init [--admin-password <pw>] [--host 0.0.0.0] [--port 8317]');
+  console.log('  init [--admin-password <pw>] [--host 0.0.0.0] [--port 8317] [--default-model <id>]');
   console.log('                         生成 npm run gateway 用的配置（0600）');
-  console.log('  serve [--host 0.0.0.0] [--db] [--admin-password <pw>] [--config <file>]');
+  console.log('  serve [--host 0.0.0.0] [--db] [--admin-password <pw>] [--default-model <id>] [--config <file>]');
   console.log('                         启动 OpenAI 兼容服务；--db 开启多 key + 记账');
   console.log(`                         配置默认读 ${DEFAULT_CONFIG}（npm run gateway 用）`);
   console.log('  stop                   停止占用配置端口的网关进程');

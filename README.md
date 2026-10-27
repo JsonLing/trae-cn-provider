@@ -222,6 +222,7 @@ curl -N http://10.255.47.198:8317/v1/chat/completions \
 | `npm run gateway:init -- --admin-password '口令'` | 首次配置，写 `~/.trae-proxy/gateway.json`（0600） |
 | `npm run gateway` | 按该配置启动 b2b 网关（读 host / port / db / 口令） |
 | `npm run gateway:local` | 不写配置文件、用本仓库 `.gateway/gateway.db`，口令取 `$ADMIN_PASSWORD` |
+| `npm run gateway:deepseek` | 同上，但默认模型固定为 `DeepSeek-V4.1-Flash-1017` |
 | `npm run gateway:stop` | 停掉配置端口上的网关进程 |
 | `npm run keys` | 查看 key 与今日用量 |
 | `npm run keys:add -- 张三 --limit 200000` | 建一把 key（完整值只打印一次） |
@@ -244,6 +245,22 @@ npm run gateway:local
 
 `--config` 指向的文件必须存在：写错路径会立刻报错，而不是静默退化成单用户模式
 （那会启动一个你以为不是的东西）。
+
+### 指定默认模型
+
+请求不传 `model`（或用 `auto` / `default`）时，默认落到**模型目录里的第一条** —— 而 Trae 的
+目录把 `Doubao-Seed-Evolving` 排在第一位。给同事用时，这通常不是他们想要的。
+
+```bash
+node src/cli.js serve --host 0.0.0.0 --db --admin-password '口令' \
+  --default-model DeepSeek-V4.1-Flash-1017
+# 或在 gateway.json 里写 "defaultModel": "DeepSeek-V4.1-Flash-1017"
+```
+
+配置后启动日志会打印一行 `默认模型: DeepSeek-V4.1-Flash-1017（请求不传 model 时使用）`。
+名字大小写不敏感，也接受 `model_name` / 显示名 / 子串（`1017` 同样命中）。
+显式传 `model` 时仍然以调用方为准；配置的模型若已从目录下线，会**退回目录第一条并打印警告**，
+而不是让每个请求都 404。
 
 ### 三个命令够日常用
 
