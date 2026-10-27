@@ -14,7 +14,7 @@ import { assert, assertEqual, installShims, load, mockFetch, sse, sseResponse, t
 
 installShims();
 
-const { chat, ideHeaders } = await load('src/trae-client.js');
+const { apiHostFor, chat, ideHeaders } = await load('src/trae-client.js');
 const { refreshToken, parseCallback, needsRefresh } = await load('src/trae-auth.js');
 const { TraeProvider } = await load('src/openai-server.js');
 const { TcDecryptError, readLocalCredentials, parseAuthValue } = await load('src/trae-local-credentials.js');
@@ -124,6 +124,29 @@ await test('both response envelopes decode, and enterprise errors are rejected',
   }
 });
 
+await test('the AI gateway follows a tenant credential, not the consumer auth host', async () => {
+  assertEqual(apiHostFor({}), 'https://trae-api-cn.mchost.guru', 'no host → CN gateway');
+  assertEqual(apiHostFor({ host: 'https://api.trae.cn' }), 'https://trae-api-cn.mchost.guru', 'consumer auth host is not an AI host');
+  assertEqual(apiHostFor({ host: 'https://api-sg-central.trae.ai' }), 'https://a0ai-api-sg.byteintlapi.com', 'SG auth host maps to the SG gateway');
+  assertEqual(apiHostFor({ host: 'https://console.enterprise.trae.cn/' }), 'https://console.enterprise.trae.cn', 'tenant host wins and the slash is trimmed');
+
+  const seen = [];
+  const mock = mockFetch((url) => {
+    seen.push(url);
+    return sseResponse(`${sse('done', { finish_reason: 'stop' })}data: [DONE]\n\n`);
+  });
+  try {
+    await chat({
+      creds: { token: 't', host: 'https://console.enterprise.trae.cn' },
+      env: ENV,
+      body: { messages: [] },
+    });
+  } finally {
+    mock.restore();
+  }
+  assertEqual(seen[0], 'https://console.enterprise.trae.cn/api/agent/v3/llm_utils_chat', 'chat goes to the tenant gateway');
+});
+
 await test('chat() uses caller headers when given, and the default IDE headers otherwise', async () => {
   const seen = [];
   const mock = mockFetch((url, init) => {
@@ -141,6 +164,49 @@ await test('chat() uses caller headers when given, and the default IDE headers o
     });
     assert(!seen[0]['user-agent'], 'default path has no attribution');
     assertEqual(seen[1]['user-agent'], 'attributed', 'caller headers win');
+  } finally {
+    mock.restore();
+  }
+});
+
+await test('notify_usage is quota data, never token usage', async () => {
+  const events = [];
+  const mock = mockFetch(() =>
+    sseResponse(
+      `${sse('notify_usage', { billing_mode: 'credits', cn_credits_remain_info: { ide_credits: 0, work_credits: 0 }, usage: { cn_credits: 0 } })}` +
+        `${sse('output', { content: 'x' })}` +
+        `${sse('token_usage', { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 })}` +
+        `${sse('done', { finish_reason: 'stop' })}data: [DONE]\n\n`,
+    ),
+  );
+  try {
+    const result = await chat({ creds: { token: 't', userId: 'u' }, env: ENV, body: { messages: [] }, onEvent: (e) => events.push(e) });
+    assertEqual(result.usage.prompt_tokens, 5, 'token_usage survives the quota frame');
+    assertEqual(events.filter((e) => e.type === 'usage').length, 1, 'only token usage is reported');
+  } finally {
+    mock.restore();
+  }
+});
+
+await test('a 4008 carries the quota snapshot it arrived with', async () => {
+  const mock = mockFetch(() =>
+    sseResponse(
+      `${sse('notify_usage', { billing_mode: 'credits', cn_credits_remain_info: { ide_credits: 0, work_credits: 0 }, remain_usage: { cn_credits: 0 } })}` +
+        `${sse('error', { code: 4008, message: 'Your requests have exceeded the quota.' })}` +
+        `${sse('done', { finish_reason: 'stop' })}\n\n`,
+    ),
+  );
+  try {
+    let caught;
+    try {
+      await chat({ creds: { token: 't', userId: 'u' }, env: ENV, body: { messages: [] } });
+    } catch (err) {
+      caught = err;
+    }
+    assert(caught, 'a 4008 throws');
+    assertEqual(caught.code, 4008, 'code preserved');
+    assert(caught.message.includes('ide_credits=0'), 'quota snapshot in the message');
+    assertEqual(caught.billingMode, 'credits', 'billing mode exposed on the error');
   } finally {
     mock.restore();
   }

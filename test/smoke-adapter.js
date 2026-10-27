@@ -90,7 +90,7 @@ function stubStore(creds = CREDS) {
 }
 
 /** Build one adapter with the scripted environment. */
-function makeAdapter({ creds = CREDS, logger = recordingLogger() } = {}) {
+function makeAdapter({ creds = CREDS, logger = recordingLogger(), requestStyle = 'inline_chat' } = {}) {
   return {
     logger,
     adapter: new TraeAdapter({
@@ -98,13 +98,39 @@ function makeAdapter({ creds = CREDS, logger = recordingLogger() } = {}) {
       env: ENV,
       credentials: stubStore(creds),
       logger,
-      requestStyle: 'inline_chat',
+      requestStyle,
       catalogTtlMs: 60_000,
     }),
   };
 }
 
 console.log('smoke-adapter:');
+
+await test('chat_v3 carries the harness session id so a tenant gateway can bill a seat', async () => {
+  const mock = mockFetch((url) => {
+    if (url.includes('get_detail_param')) return CATALOG;
+    if (url.includes('llm_utils_chat')) return sseResponse(STREAM);
+    throw new Error(`unexpected url ${url}`);
+  });
+  try {
+    const { adapter } = makeAdapter({ requestStyle: 'chat_v3' });
+    for await (const _chunk of adapter.stream({
+      provider: 'trae-cn',
+      model: 'glm-5.2',
+      sessionId: 'sess-from-harness',
+      messages: [userMessage('hi')],
+    })) {
+      // drain
+    }
+    const call = mock.calls.find((entry) => entry.url.includes('llm_utils_chat'));
+    const body = JSON.parse(call.init.body);
+    assertEqual(body.function, 'chat_v3', 'function');
+    assertEqual(body.session_id, 'sess-from-harness', 'session_id');
+    assertEqual(body.conversation_id, 'sess-from-harness', 'conversation_id');
+  } finally {
+    mock.restore();
+  }
+});
 
 await test('listModels maps the catalog to LlmModelInfo and never returns []', async () => {
   const mock = mockFetch((url) => {
@@ -464,6 +490,36 @@ await test('upstream failures become a terminal error finish with a stable code'
     assertEqual(finish.reason.failure.code, 'RATE_LIMIT', 'code');
     assert(/HTTP 429/.test(finish.reason.failure.message), 'upstream status in message');
     assert(!/fake-refresh-token/.test(logger.text()), 'no token in the log');
+  } finally {
+    mock.restore();
+  }
+});
+
+await test('a 4008 on the wire becomes a QUOTA finish carrying the balance', async () => {
+  const mock = mockFetch((url) => {
+    if (url.includes('get_detail_param')) return CATALOG;
+    if (url.includes('llm_utils_chat')) {
+      return sseResponse(
+        `${sse('notify_usage', { billing_mode: 'credits', cn_credits_remain_info: { ide_credits: 0, work_credits: 0 } })}` +
+          `${sse('error', { code: 4008, message: 'Your requests have exceeded the quota.' })}` +
+          `${sse('done', { finish_reason: 'stop' })}\n\n`,
+      );
+    }
+    throw new Error(`unexpected url ${url}`);
+  });
+  try {
+    const { adapter } = makeAdapter();
+    const chunks = [];
+    for await (const chunk of adapter.stream({
+      provider: 'trae-cn',
+      model: 'glm-5.2',
+      messages: [userMessage('hi')],
+    })) {
+      chunks.push(chunk);
+    }
+    const failure = chunks.at(-1)?.reason?.failure;
+    assertEqual(failure.code, 'QUOTA', 'code');
+    assert(/ide_credits=0/.test(failure.message), 'balance is in the message');
   } finally {
     mock.restore();
   }

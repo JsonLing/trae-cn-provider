@@ -217,7 +217,7 @@ node src/cli.js chat "你好"
 
 - **DSH 原生 `LlmAdapter`**，不是外部 HTTP 服务的壳 —— 工具调用、思考档位、usage 走 DSH 原生类型，不经过有损的 OpenAI 转换
 - **不自己 listen 端口**，OpenAI 兼容面挂在宿主 web server 上
-- 企业版账号的刷新按账号自身的 host 走（见下），这是同类项目普遍没处理的
+- 企业版账号的**刷新**与**AI 网关**都按账号自身的租户 host 走，聊天请求还会带上 `session_id` 以便按会话计费 —— 这是同类项目普遍没处理的
 - 凭据落在用户目录的 `0600` 文件，不落在包目录
 - 全部出网域名可枚举、有完整性校验、凭据不进日志
 
@@ -236,6 +236,7 @@ node src/cli.js chat "你好"
 | `finish` 语义 | 上游在带工具调用时也回 `finish_reason: "stop"`，已按实测改成 `{kind:'tool-calls'}` |
 | OpenAI 兼容层 | `/v1/models`、`/v1/chat/completions`（流式 + 非流式） |
 | 多模态图片输入 | 96×96 纯红 PNG 走**两条路径**都实测通过：DSH `{type:'image'}` 块 + attachments 缝，以及 OpenAI 层的 `image_url` data URL —— 模型均回答「红色」。脚本 `test/live-image.js` |
+| 企业版租户网关 | 目录 200/50 条 → 23 个可用模型；聊天必须带 `session_id`（否则 4001/4008），带后正文 + `token_usage` 正常；企业控制台按会话计量 |
 | 本机凭据 `tc` 解密 | `cn`（加密）/ `sg`（明文）两种格式均解出并调通上游 |
 | token 刷新 | OAuth 与 local **两条来源都曾刷新成功**（走账号自己的 host、双信封解析）。**注意 refresh token 会被作废**，见下方「refresh token 会失效」 |
 | 过期触发刷新链路 | `test/live-refresh.js` 用隔离的凭据副本把 `expiresAt` 强制到过去，验证「过期 → 自动刷新 → 请求成功 → 新 token 落盘」；当前该凭据的 refresh token 已失效，**需要重新登录后本项才能通过**（脚本会明确诊断，不会让你误以为插件坏了） |
@@ -268,6 +269,68 @@ node src/cli.js chat "你好"
 
 ---
 
+## 额度与用量（`4008` 排错）
+
+`trae 4008: Your requests have exceeded the quota.` 是**上游**的错误，插件只是把它透出来。它有两种完全不同的成因：
+
+### 成因 A：企业账号打错了网关（0.1.7 之前的默认行为）
+
+企业账号（JWT 里 `tenant_id: tob_online`）的 AI 流量必须打到**租户网关**——凭据里的
+`saasBootConfig.apiHost`，实测就是 `https://console.enterprise.trae.cn`。它和消费版网关有三处硬区别（均已实测）：
+
+| | 消费版网关 | 企业租户网关 |
+|---|---|---|
+| host | `trae-api-cn.mchost.guru` | `console.enterprise.trae.cn` |
+| 目录 | 59 条，`config_name` 形如 `Doubao-Seed-2.1-Turbo` | 50 条，形如 `Doubao-Seed-2.1-turbo`，带 `tob_commercial_info.seat_discount_factor` |
+| 请求体 | `session_id` 可省略 | **必须带 `session_id`**，否则也回 4008 |
+
+把企业账号的请求发到消费版网关时，网关会按**个人积分账本**结算；那个账本为 0，于是即使企业控制台里
+「基础会话」还有 ¥300，也照样 4008。0.1.7 起：
+
+- `apiHostFor(creds)` 用凭据里的租户 host 作为 AI 网关（`api.trae.cn` 这类**只做鉴权**的 host 会被排除）；
+- `chat_v3` 请求体固定带上 `session_id` / `conversation_id`（DSH 会话 id，缺省用每请求 UUID）。
+
+于是企业账号的调用会走租户网关、按**会话**记到席位额度，企业控制台的「各会话用量」也能看到 ——
+「Trae 监控不到使用记录」随之消失。
+
+### 成因 B：消费版账号的积分真的用完了
+
+同一条流里还有 `notify_usage`，是网关下发的余额快照：
+
+```
+event: notify_usage
+data: {"remain_usage":{"cn_credits":0,...},"billing_mode":"credits",
+       "cn_credits_remain_info":{"ide_credits":0,"work_credits":0}}
+event: error
+data: {"code":4008,"message":"Your requests have exceeded the quota."}
+```
+
+0.1.7 起这两条会合并进错误消息，并被 DSH 归类为 `QUOTA`：
+
+```
+trae 4008: …（上游额度：ide_credits=0 work_credits=0; billing=credits；用 `trae-cn usage` 查看账号余额）
+```
+
+### 查余额：`trae-cn usage`
+
+```sh
+node src/cli.js usage      # 或 npm run usage
+```
+
+只读调用 `POST https://api.trae.cn/trae/api/v2/pay/web_user_ent_usage`（网页用量页同源，**不消耗积分**），
+输出总量 / 已用 / 可用 / 各积分包。**这是个人积分账本**：企业账号看到 0 不代表席位额度为 0 —— 席位额度在
+企业控制台「用量管理」里，按会话计费。企业账号的 0 余额输出会明确写出这一点（消费版账号则直接说明 4008 是预期结果）。
+
+### 判断顺序
+
+1. 企业账号：先确认请求走的是不是租户网关（错误消息里若出现 `billing=credits` 且控制台有 ¥ 额度，基本就是走错了）。
+   0.1.7 已自动选网关，重装插件即可。
+2. 跑一次 `trae-cn usage`：消费版账号可用 0 → 换账号或充值；企业账号的 0 只是个人账本，不具决定性。
+3. 企业控制台「基础会话用量」仍为 0 而 IDE 也不能用 → 让管理员检查席位额度 / 共享额度池，或向 Trae 提工单
+   （附上报错里的 `x-tt-logid`）。
+
+---
+
 ## 出网清单
 
 代码里出现的全部外部域名：
@@ -276,8 +339,8 @@ node src/cli.js chat "你好"
 |---|---|
 | `trae-api-cn.mchost.guru` | CN 版模型目录 + 聊天 |
 | `a0ai-api-sg.byteintlapi.com` | 国际版模型目录 + 聊天 |
-| `api.trae.cn` | 令牌刷新（默认 host） |
-| `console.enterprise.trae.cn` 等 | 企业版账号**自己的**刷新 host（由凭据决定，不写死） |
+| `api.trae.cn` | 令牌刷新（默认 host）+ 额度查询（只读） |
+| `console.enterprise.trae.cn` 等 | 企业版账号**自己的**网关：令牌刷新 + 模型目录 + 聊天（由凭据决定，不写死） |
 | `www.trae.cn` | 浏览器授权页（仅 `oauth` 来源，由浏览器打开） |
 | `127.0.0.1` | 本地回调监听（仅 `oauth` 登录期间，临时端口，用完即关） |
 
@@ -325,21 +388,23 @@ src/trae-client.js 上游客户端：目录 + SSE 解析 + 工具调用累积
 src/trae-auth.js   OAuth 登录、回调解析、令牌刷新（两种信封）
 src/trae-local-credentials.js 本机凭据读取（tc 解密 + 明文）
 src/openai-server.js OpenAI 兼容层
-src/cli.js         独立 CLI（login / models / serve / chat）
+src/quota.js       只读额度快照（4008 排错用）
+src/cli.js         独立 CLI（login / models / serve / chat / usage）
 ```
 
 ## 开发
 
 ```bash
-npm run check     # 语法 + YAML + 清单一致性 + Config schema + 四套 smoke 测试（全部离线，mock fetch）
-npm test          # 只跑四套 smoke 测试
+npm run check     # 语法 + YAML + 清单一致性 + Config schema + 五套 smoke 测试（全部离线，mock fetch）
+npm test          # 只跑五套 smoke 测试
 ```
 
-smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**。四套分别覆盖：
+smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**。五套分别覆盖：
 
 - `smoke-adapter.js` — `LlmAdapter` 契约：目录映射、chunk 序列、思考档位、工具调用、usage 映射，以及**凭据刷新的三条不变量**（并发调用只刷新一次、401 只重试一次不会无限循环、失效 refresh token 报可操作的 `REFRESH_FAILED`）
 - `smoke-client.js` — 上游客户端与凭据：企业版刷新主机、双响应信封、回调解析、tc 解密
 - `smoke-plugin.js` — **插件入口 `apply()`**：Config 是否是可被 cordis 校验的 Standard Schema、provider/adapter 是否按契约注册、挂载的 OpenAI 接口是否真的能应答，以及 **`prepareCall().stream()` 同步返回 AsyncIterable**（防 `[Symbol.asyncIterator] is not a function` 回归）
+- `smoke-quota.js` — 额度快照与 4008：摘要解析、405/business-code 报错、`formatQuota` 的零余额提示，以及 `4008` 的错误消息里必须带上 `notify_usage` 的额度
 - `smoke-login.js` — **`/trae-login` 命令全链路**：命令注册 → `webLogin` → 授权链接 → **合成 Trae 的真实回调** → 凭据落盘。它把 `openInApp` 换成桩（否则会真的弹出浏览器），并用 `TRAE_PROXY_CRED_DIR` 隔离凭据文件，**不会碰你真实的登录态**
 
 另有两个**需要联网的手动脚本**（不在 `npm run check` 里）：
@@ -451,7 +516,7 @@ dsh plugin --profile desktop add trae-cn-provider   # 需先完全退出桌面�
 
 **2. `prepublishOnly` 会先跑完 `npm run check`。**
 
-所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、四套 smoke）。
+所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、五套 smoke）。
 
 ### 上架 dsh.so（社区插件市场）
 
@@ -559,6 +624,7 @@ providers:
 | `HTTP 429: Insufficient balance or no resource package`，且 `provider: zai`、`base_url: https://api.z.ai/...` | 请求**根本没走 Trae**，打到了 Z.AI 官方接口（`GLM_API_KEY` 余额不足） | 确认 `model.provider` 是 `trae`；**已有会话会保留自己的 provider/model**，需要新开一个对话，或在输入框的模型选择器里选 trae 分组下的模型 |
 | `ECONNREFUSED 127.0.0.1:<port>`，Hermes 日志出现 `probe-down` | base_url 的端口没有进程监听 | 按上表重新确认端口；DSH 重启后必须换成新端口，或改用固定端口的独立进程 |
 | 模型列表里只有 `zai` 的模型、看不到 `trae` | `providers.trae` 没被读入，或 base_url 连不上导致模型发现失败 | `hermes config get providers.trae`；先 `curl` 自检端点 |
+| `trae 4008: Your requests have exceeded the quota.` | 账号可用额度为 0（`notify_usage` 里全是 0）；企业账号的额度池按会话计费，直连调用看不到 | `npm run usage` 查余额；判断方法见「额度与用量（`4008` 排错）」 |
 
 > **模型名会撞车。** Trae 和 Z.AI 都有 `glm-5.2` / `glm-5.3`。只写模型名时，Hermes 可能把 `glm-*` 解析回 Z.AI 的 `zai` provider，于是又变成余额报错。选模型时要选 **trae 分组**下的那个，而不是 `zai` 分组下的同名项。
 
@@ -652,6 +718,7 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
+| **0.1.7** | **企业账号 4008 修复**：企业流量必须打租户网关（凭据里的 `saasBootConfig.apiHost`，如 `console.enterprise.trae.cn`），且请求体必须带 `session_id`，否则消费版网关会按个人积分结算并回 `4008`——即使企业席位额度还有 ¥300。现在 `apiHostFor()` 自动选网关、`session_id`/`conversation_id` 固定随请求发送，企业控制台也能按会话看到用量。另加额度可观测：① 只读 `trae-cn usage`（`npm run usage`）查询 `web_user_ent_usage`，不消耗积分；② `notify_usage` 不再被当成 token usage；③ `4008` 带 `ide_credits`/`work_credits`/`billing_mode` 并被 DSH 归类为 `QUOTA`。文档新增「额度与用量（4008 排错）」 |
 | **0.1.6** | 安全加固，来自 dsh.so 动态审计的两条发现：① `/v1` 默认不再下发 `Access-Control-Allow-Origin: *`，带 `Origin` 头的请求一律 `403`（新增 `allowBrowserOrigins` 白名单）—— 以前任意网页都能用你的 Trae 额度；② `login-debug.log` 落盘前对回调参数脱敏，`userJwt` / `refreshToken` / `userInfo` 等敏感值替换成 `<redacted N>` —— 以前令牌会被复制到凭据文件之外。两条都有回归测试锁住 |
 | 0.1.5 | 文档为主：新增「让别的 agent 框架也用上（以 Hermes 为例）」的完整接法与排错 —— DSH 宿主端口每次启动都会变、桌面端输入框的模型选择是粘性的、`fallback_providers` 必须是 YAML 列表（写成 JSON 字符串会被静默忽略）；补 LaunchAgent 常驻写法。运行时行为与 0.1.4 一致 |
 | 0.1.4 | 模型目录 7 → 20：三处版本码统一到 `20260901`，`DeviceName` 对齐真客户端 |

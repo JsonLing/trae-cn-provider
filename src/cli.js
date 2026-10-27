@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // cli.js - login / models / serve / chat
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import { detectEnv, loadCredentials, saveCredentials, CRED_FILE } from './env.js';
 import { webLogin } from './trae-auth.js';
 import { chat } from './trae-client.js';
+import { fetchQuota, formatQuota, tenantOf } from './quota.js';
 import { TraeProvider, startServer } from './openai-server.js';
 
 function requireCredentials() {
@@ -98,6 +100,9 @@ async function cmdChat() {
     config_source: caps.configSource ?? 1,
     is_custom_model: false,
     provider: caps.provider || '',
+    // Enterprise gateways bill a seat per chat session; without it the call is
+    // scored against the consumer credit ledger and answers 4008.
+    session_id: crypto.randomUUID(),
   };
   const result = await chat({
     creds: provider.creds,
@@ -112,11 +117,17 @@ async function cmdChat() {
   if (result.usage) console.error(`\n[usage] ${JSON.stringify(result.usage)}`);
 }
 
-const commands = { login: cmdLogin, models: cmdModels, serve: cmdServe, chat: cmdChat };
+async function cmdUsage() {
+  const creds = requireCredentials();
+  const snapshot = await fetchQuota(creds);
+  console.log(formatQuota(snapshot, { ...tenantOf(creds.token), username: creds.username || '' }));
+}
+
+const commands = { login: cmdLogin, models: cmdModels, serve: cmdServe, chat: cmdChat, usage: cmdUsage };
 
 const command = process.argv[2];
 if (!commands[command]) {
-  console.log('用法: node src/cli.js <login|models|serve|chat>');
+  console.log('用法: node src/cli.js <login|models|serve|chat|usage>');
   process.exit(command ? 1 : 0);
 }
 commands[command]().catch((err) => {

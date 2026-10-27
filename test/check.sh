@@ -76,6 +76,8 @@ echo "== smoke: plugin entry =="
 node test/smoke-plugin.js | tail -1
 echo "== smoke: login command =="
 node test/smoke-login.js | tail -1
+echo "== smoke: quota =="
+node test/smoke-quota.js | tail -1
 
 echo
 echo "all checks passed"

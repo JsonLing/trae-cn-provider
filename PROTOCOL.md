@@ -435,3 +435,73 @@ refresh token **不是一次性**的：重复刷新返回同一枚新 refreshTok
   **Trae 自己的 EC 设备密钥对**（私钥导出的公钥与存储公钥一致，已校验）。
   本机凭据的刷新实测**不需要**设备签名；该密钥对推测用于其它需要 DeviceProof 的接口。
 - 本机凭据的 refreshToken 形态为 `<base64>.` + 16 位 hex 后缀（共 61 字符）。
+
+---
+
+# 附四：企业版（租户）AI 网关与会话计费（2026-10-27 实测）
+
+企业账号（JWT `data.tenant_id = tob_online`、`data.tob_tenant_id = <租户号>`）的 AI 流量**不在
+`trae-api-cn.mchost.guru` 上结算**。用同一份凭据分别打两个 host，差异是可复现的：
+
+| 观测项 | `trae-api-cn.mchost.guru`（消费版） | `console.enterprise.trae.cn`（租户版） |
+|---|---|---|
+| `POST /api/ide/v1/get_detail_param` | 200，59 条 | 200，50 条；条目带 `tob_commercial_info.seat_discount_factor` |
+| `config_name` 形态 | `Doubao-Seed-2.1-Turbo` | `Doubao-Seed-2.1-turbo`（小写连字符） |
+| `usage` 字段 | 常缺省 | `chat_completion` 等，可直接用于过滤 |
+| `POST /api/agent/v3/llm_utils_chat`（原 body） | **4008** `Your requests have exceeded the quota.` | **4001** `param is invalid` |
+| 同上 + `session_id` | 仍 4008（个人积分账本为 0） | **200 + 正常 SSE** |
+
+## 最小必要改动
+
+只给 body 加一个 `session_id`（字符串，任意稳定 id；`conversation_id`/`request_seq` 均可选）：
+
+```
+{"messages":[...],"function":"chat_v3","stream":true,
+ "config_name":"Doubao-Seed-2.1-turbo","model":"Doubao-Seed-2.1-turbo__dev",
+ "config_source":1,"is_custom_model":false,"provider":"",
+ "session_id":"<uuid>"}
+```
+
+实测对照：
+
+| body | 结果 |
+|---|---|
+| 无 session 字段 | 4001 param is invalid |
+| 只有 `conversation_id` | 4001 param is invalid |
+| 只有 `session_id` | 200 + `metadata` → `output` → `token_usage` → `done` |
+| `session_id` + `conversation_id` (+ `request_seq`) | 200，同上 |
+
+同一 `session_id`、`request_seq` 重复 1 也照常返回；换新 session 同样成功。也就是说网关只要求
+**会话存在**，不校验序号严格递增。
+
+## 为什么这解释了「有额度还 4008」
+
+- 企业控制台的「基础会话」额度（¥/席位/周期）按**会话**计量；请求没有 `session_id` 时，租户网关
+  认为它不是一次可计费的会话，直接 4001；而消费版网关会把同一请求记到**个人积分账本**
+  （`billing_mode: "credits"`，`cn_credits_remain_info` 全 0），个人积分为 0 → 4008。
+- 企业账号的逐笔用量也因此挂在**会话**下：控制台 → 用量管理 → 人员用量 / 各会话明细。
+  不带 `session_id` 的直连调用既不计费也不出现在明细里 —— 即「监控不到使用记录」。
+
+## 网关选择
+
+租户网关就是凭据里的 `saasBootConfig.apiHost`（本机 tc 明文、网页登录回调的 `host` 参数都带它）。
+`api.trae.cn` 只能做鉴权/刷新（对 `/api/agent/v3/llm_utils_chat` 回 405），不能当 AI 网关。
+`work.enterprise.trae.cn` 对聊天路径回 405，目录可用，但不作为聊天端点。
+
+## 复现命令（无需插件）
+
+```bash
+H=https://console.enterprise.trae.cn
+# 1) 目录
+curl -sS -X POST "$H/api/ide/v1/get_detail_param" \
+  -H "Authorization: Cloud-IDE-JWT $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"function":"chat_v3","config_names":null,"need_prompt":false,"current_config_info":null,"poly_prompt":true,"mode_type":null,"agent_type":null}'
+# 2) 聊天（注意 session_id）
+curl -sS -N -X POST "$H/api/agent/v3/llm_utils_chat" \
+  -H "Authorization: Cloud-IDE-JWT $TOKEN" -H 'Content-Type: application/json' \
+  -H 'Accept: text/event-stream' \
+  -d '{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
+       "function":"chat_v3","stream":true,"config_name":"Doubao-Seed-2.1-turbo",
+       "model":"Doubao-Seed-2.1-turbo__dev","config_source":1,
+       "is_custom_model":false,"provider":"","session_id":"11111111-1111-4111-8111-111111111111"}'
+```

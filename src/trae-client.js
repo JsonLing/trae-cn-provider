@@ -3,7 +3,36 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 
 const CHAT_HOST = 'https://trae-api-cn.mchost.guru';
+const SG_CHAT_HOST = 'https://a0ai-api-sg.byteintlapi.com';
 const IDE_APP_ID = '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8';
+
+// Auth hosts do NOT serve the AI API: a consumer login stores `host` as the
+// token-refresh host, and posting a chat to it returns 405. Tenant (enterprise)
+// logins store their own gateway instead, and that gateway *does* serve
+// `/api/ide/v1` and `/api/agent/v3` — measured against
+// `console.enterprise.trae.cn`, which also returns a tenant-specific catalog
+// (`tob_commercial_info.seat_discount_factor`) and requires `session_id` in the
+// chat body before it will bill a seat instead of the consumer credit ledger.
+const AUTH_ONLY_HOSTS = new Set([
+  'https://api.trae.cn',
+  'https://www.trae.cn',
+  'https://api.trae.ai',
+  'https://www.trae.ai',
+  'https://api-sg-central.trae.ai',
+]);
+
+/**
+ * Pick the upstream AI gateway for a credential set.
+ * @param {{host?: string}} creds
+ * @returns {string} base URL without a trailing slash
+ */
+export function apiHostFor(creds) {
+  const host = String(creds?.host || '').trim().replace(/\/+$/, '');
+  if (!host) return CHAT_HOST;
+  if (host.includes('trae.ai') && !host.includes('enterprise')) return SG_CHAT_HOST;
+  if (AUTH_ONLY_HOSTS.has(host)) return CHAT_HOST;
+  return host;
+}
 
 export function ideHeaders(creds, env, { sse = false } = {}) {
   return {
@@ -233,7 +262,7 @@ const catalogBody = (fn) => ({
 /** 拉一份 function 目录（chat_v3 / solo_agent），返回 ModelCaps 列表 */
 export async function fetchCatalog(creds, env, fn = 'chat_v3', extraHeaders = null) {
   const json = await postJson(
-    `${CHAT_HOST}/api/ide/v1/get_detail_param`,
+    `${apiHostFor(creds)}/api/ide/v1/get_detail_param`,
     { ...ideHeaders(creds, env), ...(extraHeaders || {}) },
     catalogBody(fn),
   );
@@ -317,6 +346,46 @@ export async function listModels(creds, env, extraHeaders = null) {
   return [...merged.values()];
 }
 
+// Quota-flavoured failures: the upstream reports them as an SSE `error` event
+// with a business code (4008 = credits exhausted), not as an HTTP status, so
+// they used to surface as an opaque "trae 4008: ..." with no actionable data.
+const QUOTA_CODES = new Set([4008, 4009, 402]);
+const QUOTA_MESSAGE = /quota|balance|credit|额度|积分/i;
+
+/** Render the quota snapshot that `notify_usage` carried, if any. */
+function quotaDetail({ remainUsage, creditsRemain, billingMode } = {}) {
+  const parts = [];
+  if (creditsRemain && typeof creditsRemain === 'object') {
+    const pairs = Object.entries(creditsRemain)
+      .filter(([, value]) => typeof value === 'number')
+      .map(([key, value]) => `${key}=${value}`);
+    if (pairs.length) parts.push(pairs.join(' '));
+  }
+  if (remainUsage && typeof remainUsage === 'object') {
+    const pairs = Object.entries(remainUsage)
+      .filter(([, value]) => typeof value === 'number')
+      .map(([key, value]) => `${key}=${value}`);
+    if (pairs.length) parts.push(`remain ${pairs.join(' ')}`);
+  }
+  if (billingMode) parts.push(`billing=${billingMode}`);
+  return parts.join('; ');
+}
+
+/**
+ * Build the message for a chat failure, appending the quota snapshot when the
+ * failure looks like an exhausted balance.
+ * @param {{code:number|string, message:string, remainUsage?:object,
+ *   creditsRemain?:object, billingMode?:string}} failure
+ * @returns {string}
+ */
+export function describeFailure(failure) {
+  const head = `trae ${failure.code}: ${failure.message}`;
+  const quotaLike = QUOTA_CODES.has(failure.code) || QUOTA_MESSAGE.test(String(failure.message ?? ''));
+  const detail = quotaLike ? quotaDetail(failure) : '';
+  if (!detail) return head;
+  return `${head}（上游额度：${detail}；用 \`trae-cn usage\` 查看账号余额）`;
+}
+
 async function* sseLines(response) {
   const decoder = new TextDecoder();
   let buffer = '';
@@ -339,7 +408,7 @@ async function* sseLines(response) {
  * 不传时行为与原来完全一致。
  */
 export async function chat({ creds, env, body, signal, headers, onEvent = () => {} }) {
-  const res = await fetch(`${CHAT_HOST}/api/agent/v3/llm_utils_chat`, {
+  const res = await fetch(`${apiHostFor(creds)}/api/agent/v3/llm_utils_chat`, {
     method: 'POST',
     headers: headers || ideHeaders(creds, env, { sse: true }),
     body: JSON.stringify(body),
@@ -357,6 +426,12 @@ export async function chat({ creds, env, body, signal, headers, onEvent = () => 
   let finishReason = '';
   let sawDone = false;
   let failure = null;
+  // `notify_usage` is the gateway's *quota* frame (remaining credits), not a
+  // token count. Keeping it separate from `usage` both avoids clobbering a real
+  // `token_usage` frame and lets a 4008 explain itself.
+  let remainUsage = null;
+  let creditsRemain = null;
+  let billingMode = '';
 
   // 工具调用的参数分片：partial_arguments 是本帧增量；arguments 在不同模型上
   // 既可能是增量片段，也可能是从头开始的累计快照。
@@ -420,7 +495,18 @@ export async function chat({ creds, env, body, signal, headers, onEvent = () => 
       failure = { code: data.code ?? 0, message: data.message || '上游返回错误' };
       return;
     }
-    if (name === 'token_usage' || name === 'notify_usage' || name === 'usage') {
+    if (name === 'notify_usage') {
+      // Quota snapshot, not a token count: `usage` here is the per-category
+      // remaining balance (and `remain_usage` mirrors it). Feeding it into
+      // `usage` made the last `token_usage` frame irrelevant.
+      if (data.remain_usage && typeof data.remain_usage === 'object') remainUsage = data.remain_usage;
+      if (data.cn_credits_remain_info && typeof data.cn_credits_remain_info === 'object') {
+        creditsRemain = data.cn_credits_remain_info;
+      }
+      if (typeof data.billing_mode === 'string' && data.billing_mode) billingMode = data.billing_mode;
+      return;
+    }
+    if (name === 'token_usage' || name === 'usage') {
       const nested = data.usage && typeof data.usage === 'object' ? data.usage : null;
       usage = nested
         ? nested
@@ -480,8 +566,11 @@ export async function chat({ creds, env, body, signal, headers, onEvent = () => 
   }
 
   if (failure) {
-    const error = new Error(`trae ${failure.code}: ${failure.message}`);
+    const error = new Error(describeFailure({ ...failure, remainUsage, creditsRemain, billingMode }));
     error.code = failure.code;
+    if (remainUsage) error.remainUsage = remainUsage;
+    if (creditsRemain) error.creditsRemain = creditsRemain;
+    if (billingMode) error.billingMode = billingMode;
     throw error;
   }
   if (!sawDone) {

@@ -1,6 +1,6 @@
 {
   "name": "trae-cn-provider",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": false,
   "type": "module",
   "description": "Trae CN as a native DeepSeek Harness LLM provider: browser OAuth login by default, optional local-install credential source, OpenAI-compatible surface on the host web server",
@@ -39,6 +39,7 @@
     "src/trae-client.js",
     "src/trae-local-credentials.js",
     "src/openai-server.js",
+    "src/quota.js",
     "src/cli.js",
     "cordis.patch.yml",
     "README.md",
@@ -52,8 +53,9 @@
     "models": "node src/cli.js models",
     "serve": "node src/cli.js serve",
     "chat": "node src/cli.js chat",
+    "usage": "node src/cli.js usage",
     "check": "bash test/check.sh",
-    "test": "node test/smoke-adapter.js && node test/smoke-client.js && node test/smoke-plugin.js && node test/smoke-login.js",
+    "test": "node test/smoke-adapter.js && node test/smoke-client.js && node test/smoke-plugin.js && node test/smoke-login.js && node test/smoke-quota.js",
     "prepublishOnly": "npm run check"
   },
   "dsh": {

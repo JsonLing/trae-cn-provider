@@ -111,6 +111,9 @@ function buildTraeBody(payload, caps, stream) {
     config_source: caps.configSource ?? 1,
     is_custom_model: false,
     provider: caps.provider || '',
+    // Enterprise gateways bill a seat per chat session and refuse a
+    // session-less call with 4008; consumer gateways ignore the extra field.
+    session_id: crypto.randomUUID(),
   };
 
   const effort = payload.reasoning_effort ?? payload.reasoning?.effort;
