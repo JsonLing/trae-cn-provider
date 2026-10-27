@@ -90,13 +90,13 @@ function stubStore(creds = CREDS) {
 }
 
 /** Build one adapter with the scripted environment. */
-function makeAdapter({ creds = CREDS, logger = recordingLogger(), requestStyle = 'inline_chat' } = {}) {
+function makeAdapter({ creds = CREDS, logger = recordingLogger(), requestStyle = 'inline_chat', store } = {}) {
   return {
     logger,
     adapter: new TraeAdapter({
       ctx: { get: () => undefined },
       env: ENV,
-      credentials: stubStore(creds),
+      credentials: store ?? stubStore(creds),
       logger,
       requestStyle,
       catalogTtlMs: 60_000,
@@ -191,6 +191,57 @@ await test('missing credentials raise LlmError MISSING_CREDENTIAL, not a crash',
   assert(/trae-login/.test(caught.message), 'message names the login command');
   assert(/trae-login/.test(logger.text()), 'log line names the login command');
   assert(!/fake-access-token|fake-refresh-token/.test(caught.message + logger.text()), 'no token in message or log');
+});
+
+await test('a successful login is never shadowed by a cached MISSING_CREDENTIAL', async () => {
+  // The fresh-install sequence: boot with no login (catalog fails), then
+  // /trae-login writes a credential. Before this fix the failure was cached for
+  // CATALOG_RETRY_MS, so the selector showed "no Trae CN credentials" for five
+  // minutes AFTER a successful login.
+  const mock = mockFetch((url) => (url.includes('get_detail_param') ? CATALOG : {}));
+  const store = {
+    source: 'oauth',
+    scope: 'trae-cn-provider',
+    id: 'trae-cn',
+    fallbackFile: '/Users/victor/.trae-proxy/credentials.json',
+    current: null,
+    read: async () => store.current,
+  };
+  try {
+    const { adapter } = makeAdapter({ creds: null, store });
+    let first;
+    try {
+      await adapter.listModels('trae-cn');
+    } catch (err) {
+      first = err;
+    }
+    assertEqual(first?.code, 'MISSING_CREDENTIAL', 'boot without a login reports the code');
+    assert(!adapter.catalogs.get('trae-cn'), 'a credential failure is not cached at all');
+
+    store.current = { ...CREDS }; // /trae-login succeeded
+    const models = await adapter.listModels('trae-cn');
+    assertEqual(models.length, 2, 'the same adapter recovers without waiting for the retry window');
+  } finally {
+    mock.restore();
+  }
+});
+
+await test('invalidateCatalog drops a cached catalog so a new login re-reads it', async () => {
+  const mock = mockFetch((url) => (url.includes('get_detail_param') ? CATALOG : {}));
+  try {
+    const { adapter } = makeAdapter();
+    const before = await adapter.listModels('trae-cn');
+    assertEqual(before.length, 2, 'catalog loaded');
+    assertEqual(adapter.catalogs.get('trae-cn')?.models?.length, 2, 'catalog is cached');
+
+    adapter.invalidateCatalog();
+    assert(!adapter.catalogs.get('trae-cn'), 'cache cleared');
+
+    const after = await adapter.listModels('trae-cn');
+    assertEqual(after.length, 2, 'catalog reloads');
+  } finally {
+    mock.restore();
+  }
 });
 
 await test('a dead refresh token becomes an actionable REFRESH_FAILED, not "网络异常"', async () => {
