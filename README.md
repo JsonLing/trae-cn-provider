@@ -147,7 +147,7 @@ https://www.trae.cn/authorization?...&auth_callback_url=http://127.0.0.1:<port>/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/trae-cn/v1/models` | 模型列表 |
-| POST | `/trae-cn/v1/chat/completions` | 对话（流式 / 非流式，含 `reasoning_content` 与 tool calls） |
+| POST | `/trae-cn/v1/chat/completions` | 对话（含 `reasoning_content` 与 tool calls）。**`stream` 缺省为非流式**，与 OpenAI 规范一致；只有显式 `stream: true` 才返回 SSE |
 | GET | `/trae-cn/health` | 健康检查 |
 
 独立 CLI 也可以把同样的接口跑在自有端口上。注意独立进程的路径**没有** `/trae-cn` 前缀，直接就是 `/v1/...`
@@ -558,7 +558,7 @@ smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**�
 - `smoke-plugin.js` — **插件入口 `apply()`**：Config 是否是可被 cordis 校验的 Standard Schema、provider/adapter 是否按契约注册、挂载的 OpenAI 接口是否真的能应答，以及 **`prepareCall().stream()` 同步返回 AsyncIterable**（防 `[Symbol.asyncIterator] is not a function` 回归）
 - `smoke-quota.js` — 额度快照与 4008：摘要解析、405/business-code 报错、`formatQuota` 的零余额提示，以及 `4008` 的错误消息里必须带上 `notify_usage` 的额度
 - `smoke-login.js` — **`/trae-login` 命令全链路**：命令注册 → `webLogin` → 授权链接 → **合成 Trae 的真实回调** → 凭据落盘。它把 `openInApp` 换成桩（否则会真的弹出浏览器），并用 `TRAE_PROXY_CRED_DIR` 隔离凭据文件，**不会碰你真实的登录态**
-- `smoke-gateway.js` — **网关模式**：key 的哈希鉴权与明文回读、旧库自动迁移（补 `secret` 列）、中文 label 仍生成 `sk-<stem>-` 形状、停用与未知 key 可区分、日上限的边界（100/100 即触顶、被拒的请求不占额度、中断的请求占额度）、删 key 后历史用量仍在、**流式多 chunk 只写一行**、4008 记为 `upstream_error`、超限在**读请求体之前**就 429、中途断开记为 `aborted`、管理页鉴权与 `/v1` key 完全分离、跨站 POST 被拒，以及无 store 时仍退回单 key 模式。它用真实 `node:sqlite`（内存或临时文件）跑出真实 SQL，只 mock 上游 fetch
+- `smoke-gateway.js` — **网关模式**：省略 `stream` 必须回 JSON 而非 SSE（否则官方 SDK 全部解析失败）、key 的哈希鉴权与明文回读、旧库自动迁移（补 `secret` 列）、中文 label 仍生成 `sk-<stem>-` 形状、停用与未知 key 可区分、日上限的边界（100/100 即触顶、被拒的请求不占额度、中断的请求占额度）、删 key 后历史用量仍在、**流式多 chunk 只写一行**、4008 记为 `upstream_error`、超限在**读请求体之前**就 429、中途断开记为 `aborted`、管理页鉴权与 `/v1` key 完全分离、跨站 POST 被拒，以及无 store 时仍退回单 key 模式。它用真实 `node:sqlite`（内存或临时文件）跑出真实 SQL，只 mock 上游 fetch
 
 另有两个**需要联网的手动脚本**（不在 `npm run check` 里）：
 
@@ -934,6 +934,7 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.1** | **修「官方 SDK 拿不到回复」**：`stream` 缺省时服务返回 SSE，而 OpenAI 规范（以及官方 Python/Node 客户端）默认期望一次性 JSON —— 客户端把 SSE 正文当 JSON 解析，表现为 `choices` 为 `undefined` / 没有 content。现在只有显式 `stream: true` 才流式。另一处：`--default-model` 让省略 model 的请求不再落到目录首位的 `Doubao-Seed-Evolving`。均有回归测试 |
 | **0.2.0** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 存哈希 + 明文 / usage / quota_snapshots，旧库自动补 `secret` 列）、`keys show` 子命令、管理页可直接复制完整 key 并在创建后自动刷新定位新行、中文 label 不再生成 `sk--key-`、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（25 条断言，真实 `node:sqlite`） |
 | **0.1.8** | **修「登录成功却说没凭据」**：`catalog()` 以前会把 `MISSING_CREDENTIAL` 一起缓存 5 分钟（`CATALOG_RETRY_MS`）。全新安装时启动预拉取先失败一次，随后 `/trae-login` 成功，模型选择器却在窗口内继续重放那条缓存错误 —— 页面上就是「Trae CN 加载失败：no Trae CN credentials」，尽管 `~/.trae-proxy/credentials.json` 已经写好。现在**凭据类错误一律不缓存**（`MISSING_CREDENTIAL` / `REFRESH_FAILED` / `AUTH`），且 `/trae-login` 成功后调用 `adapter.invalidateCatalog()` 清空目录并立即预热，登录即刻生效。两条回归测试锁住 |
 | **0.1.7** | **企业账号 4008 修复**：企业流量必须打租户网关（凭据里的 `saasBootConfig.apiHost`，如 `console.enterprise.trae.cn`），且请求体必须带 `session_id`，否则消费版网关会按个人积分结算并回 `4008`——即使企业席位额度还有 ¥300。现在 `apiHostFor()` 自动选网关、`session_id`/`conversation_id` 固定随请求发送，企业控制台也能按会话看到用量。另加额度可观测：① 只读 `trae-cn usage`（`npm run usage`）查询 `web_user_ent_usage`，不消耗积分；② `notify_usage` 不再被当成 token usage；③ `4008` 带 `ide_credits`/`work_credits`/`billing_mode` 并被 DSH 归类为 `QUOTA`。文档新增「额度与用量（4008 排错）」 |

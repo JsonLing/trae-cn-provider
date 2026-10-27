@@ -388,7 +388,12 @@ export function createRequestHandler(
           recordUsage({ model: payload.model ?? null, status: STATUS.upstreamError, error: 'unknown model' });
           return sendError(res, 404, `未知模型: ${payload.model}`);
         }
-        const wantStream = payload.stream !== false;
+        // OpenAI's default is NON-streaming: `stream` is optional and absent
+        // means "give me one JSON body". This used to be `!== false`, which
+        // made every SDK call that omitted the flag receive an SSE stream — the
+        // official Python/Node clients then failed to parse it (`choices`
+        // undefined). Only an explicit `stream: true` may select streaming.
+        const wantStream = payload.stream === true;
         const body = buildTraeBody(payload, caps, wantStream);
         const modelId = caps.configName;
         // The upstream session id is generated inside `buildTraeBody`; echoing

@@ -336,6 +336,55 @@ await test('a non-streaming call records prompt, completion and total tokens', a
   }
 });
 
+await test('an omitted `stream` yields a JSON body, not an SSE stream', async () => {
+  // OpenAI's default is non-streaming. Getting this wrong is invisible to curl
+  // but breaks every official SDK: the client parses an SSE body as JSON and
+  // reports `choices` undefined.
+  const store = openStore(':memory:');
+  store.addKey({ key: 'sk-vera-x', label: 'vera' });
+  const provider = await makeProvider();
+  const gateway = await startGateway(provider, store);
+  const mock = mockFetch(() =>
+    sseResponse(
+      sse('output', { content: 'hi' }) +
+        sse('token_usage', { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 }) +
+        sse('done', { finish_reason: 'stop' }),
+    ),
+  );
+  try {
+    // No `stream` key at all — exactly what the Python/Node SDKs send.
+    const implicit = await realFetch(`${gateway.base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer sk-vera-x', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assertEqual(implicit.status, 200, 'the call succeeds');
+    assert(
+      (implicit.headers.get('content-type') || '').includes('application/json'),
+      `an omitted stream must answer JSON, got ${implicit.headers.get('content-type')}`,
+    );
+    const body = await implicit.json();
+    assertEqual(body.object, 'chat.completion', 'the payload is a full completion');
+    assertEqual(body.choices[0].message.content, 'hi', 'with the assistant text');
+
+    // An explicit `stream: true` still streams.
+    const explicit = await realFetch(`${gateway.base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer sk-vera-x', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'glm-5.2', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert(
+      (explicit.headers.get('content-type') || '').includes('text/event-stream'),
+      'stream:true still answers SSE',
+    );
+    await explicit.text();
+  } finally {
+    mock.restore();
+    await gateway.close();
+    store.close();
+  }
+});
+
 await test('a streaming call records exactly one row, not one per chunk', async () => {
   const store = openStore(':memory:');
   store.addKey({ key: 'sk-kim-x', label: 'kim' });
