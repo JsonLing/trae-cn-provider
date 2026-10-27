@@ -7,6 +7,7 @@
 // Everything here is offline: the upstream is a scripted `fetch`, and the
 // database is a real (in-memory or temp-file) SQLite opened through
 // `node:sqlite`, so the SQL itself is exercised rather than mocked.
+import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -81,6 +82,23 @@ async function startGateway(provider, store, options = {}) {
 }
 
 const realFetch = globalThis.fetch;
+
+/** GET a URL while forcing a specific `Host` header (fetch forbids it). */
+function getWithHost(url, hostHeader) {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: target.hostname, port: target.port, path: target.pathname + target.search, headers: { Host: hostHeader } },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
 
 console.log('smoke-gateway:');
 
@@ -682,6 +700,76 @@ await test('toggling and capping a key through the admin API takes effect immedi
     store.record({ keyId: id, keyLabel: 'rosa', totalTokens: 10, status: STATUS.ok });
     const quota = store.checkQuota(store.getKey(id));
     assertEqual(quota.allowed, false, 'and the new cap is already in force');
+  } finally {
+    await gateway.close();
+    store.close();
+  }
+});
+
+await test('the admin page reports a window, and the date picker can narrow it', async () => {
+  const store = openStore(':memory:');
+  const { id } = store.addKey({ key: 'sk-wanda-x', label: 'wanda' });
+  const today = startOfToday();
+  store.record({ keyId: id, keyLabel: 'wanda', totalTokens: 40, status: STATUS.ok, ts: today + 60 });
+  store.record({ keyId: id, keyLabel: 'wanda', totalTokens: 10, status: STATUS.ok, ts: today - 3 * 86400 + 60 });
+  const provider = await makeProvider();
+  const gateway = await startGateway(provider, store);
+
+  const day = (offset) => {
+    const d = new Date((today - offset * 86400) * 1000);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+
+  try {
+    // Default window is today only.
+    const todayOnly = await realFetch(`${gateway.base}/admin/api/overview`).then((r) => r.json());
+    assertEqual(todayOnly.window.days, 1, 'the default window is one day');
+    assertEqual(todayOnly.window.from, day(0), 'from is today');
+    assertEqual(todayOnly.report.reduce((a, r) => a + r.totalTokens, 0), 40, 'only today\'s tokens');
+    assertEqual(todayOnly.daily.length, 1, 'one bucket for one day');
+
+    // An explicit range reaches back and includes both days.
+    const ranged = await realFetch(`${gateway.base}/admin/api/overview?from=${day(3)}&to=${day(0)}`).then((r) => r.json());
+    assertEqual(ranged.window.days, 4, 'four calendar days, inclusive');
+    assertEqual(ranged.report.reduce((a, r) => a + r.totalTokens, 0), 50, 'both recorded days');
+    assertEqual(ranged.daily.length, 4, 'a bucket per day, including the quiet ones');
+    // Zero-filled buckets are what let the UI show a gap instead of hiding it.
+    assertEqual(ranged.daily.filter((d) => d.tokens === 0).length, 2, 'quiet days appear with zeros');
+
+    // A reversed range is clamped rather than returning nothing.
+    const reversed = await realFetch(`${gateway.base}/admin/api/overview?from=${day(0)}&to=${day(3)}`).then((r) => r.json());
+    assertEqual(reversed.window.days, 1, 'a to-before-from range collapses to the start day');
+
+    // Presets still work.
+    const preset = await realFetch(`${gateway.base}/admin/api/overview?days=7`).then((r) => r.json());
+    assertEqual(preset.window.days, 7, 'days=N preset');
+
+    // Requests are filtered by the same window.
+    const recent = await realFetch(`${gateway.base}/admin/api/requests?limit=50&from=${day(7)}&to=${day(0)}`).then((r) => r.json());
+    assertEqual(recent.requests.length, 2, 'both requests inside the range');
+  } finally {
+    await gateway.close();
+    store.close();
+  }
+});
+
+await test('the copy payload carries the base URL the viewer actually reached', async () => {
+  // An operator opening /admin on loopback must not hand a colleague a
+  // 127.0.0.1 URL: the key travels with the address that served the page.
+  const store = openStore(':memory:');
+  const { id, key } = store.addKey({ key: 'sk-xavier-x', label: 'xavier' });
+  const provider = await makeProvider();
+  const gateway = await startGateway(provider, store);
+  try {
+    // `fetch` refuses to override `Host` (it is a forbidden header name), so
+    // the LAN case has to go through the low-level http client.
+    const lan = await getWithHost(`${gateway.base}/admin`, '10.255.47.198:8317');
+    assert(lan.includes('http://10.255.47.198:8317/v1'), 'the LAN host appears in the copy payload');
+    assert(lan.includes(key), 'together with the key');
+
+    const loopback = await realFetch(`${gateway.base}/admin`).then((r) => r.text());
+    assert(loopback.includes('http://127.0.0.1'), 'a loopback request gets a loopback payload');
+    assert(!loopback.includes('10.255.47.198:8317'), 'and not the LAN address it was not opened on');
   } finally {
     await gateway.close();
     store.close();

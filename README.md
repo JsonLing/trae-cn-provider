@@ -289,8 +289,19 @@ unknown              2           0      0%       0         0       2
 ### 管理页
 
 `serve` 起好之后访问 `http://<host>:<port>/admin`（Basic Auth，口令即 `--admin-password`）。
-页面给出今日请求数、总 tokens、key 启停、每人用量排行、按模型分布、最近请求明细，并可以新建 key、
-改上限、停用、删除。渲染在服务端完成，**没有前端构建步骤**。
+
+![管理页](./docs/admin-ui.png)
+
+页面提供：
+
+- **统计卡片**：请求数、tokens、启用 key 数、中断次数、被拒次数、上游余额
+- **时间范围**：今日 / 近 7 天 / 近 30 天三个快捷档，外加 `from`–`to` 两个日期选择器；
+  数据为空的日子在按日序列里补 0 而不是跳过，所以安静的一天不会被压成看不见的缝隙
+- **key 与用量**：每行显示明文 key、状态、带进度条的 tokens/上限、请求数、异常数、最近调用
+- **一键复制**：每行的「复制」给的是**网关地址 + key + 默认模型**的完整小段，可直接粘给同事；
+  **地址按你访问页面时用的 Host 自动取**——从 `127.0.0.1` 打开就复制 `127.0.0.1`，
+  从内网 IP 打开就复制内网 IP，不会把只有本机可用的地址发给别人。表头另有「复制全部 key」
+- 支持新建 key、改上限、停用、删除；渲染在服务端完成，**没有前端构建步骤**
 
 管理页的鉴权是**独立**的：拿到 `/v1` key 的人打不开它。否则同事既能改自己的上限，也能看到所有人的用量。
 
@@ -935,9 +946,10 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.3** | **管理页重做**：视觉重排（卡片 / 表头 / 状态条 / 空态），时间范围支持快捷档与 `from`–`to` 日期选择器（`/admin/api/overview`、`/admin/api/requests` 均接受区间，按日序列补零不跳空日），key 行新增「复制网关地址 + key」且地址按访问者的 `Host` 自动适配，表头新增「复制全部 key」；共 29 条网关断言 |
 | **0.2.2** | **仅文档与元数据**：0.2.1 的 tarball 里 README/SECURITY 仍是 0.1.8 的内容（文档在发布之后才补），npm 不允许覆盖已发布版本，故提一个补丁版把「三种接入方式」、网关模式说明与 SECURITY 的 Gateway mode 一节一并带上。代码与 0.2.1 完全一致 |
 | **0.2.1** | **修「官方 SDK 拿不到回复」**：`stream` 缺省时服务返回 SSE，而 OpenAI 规范（以及官方 Python/Node 客户端）默认期望一次性 JSON —— 客户端把 SSE 正文当 JSON 解析，表现为 `choices` 为 `undefined` / 没有 content。现在只有显式 `stream: true` 才流式。另一处：`--default-model` 让省略 model 的请求不再落到目录首位的 `Doubao-Seed-Evolving`。均有回归测试 |
-| **0.2.0** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 存哈希 + 明文 / usage / quota_snapshots，旧库自动补 `secret` 列）、`keys show` 子命令、管理页可直接复制完整 key 并在创建后自动刷新定位新行、中文 label 不再生成 `sk--key-`、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（25 条断言，真实 `node:sqlite`） |
+| **0.2.0** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 存哈希 + 明文 / usage / quota_snapshots，旧库自动补 `secret` 列）、`keys show` 子命令、管理页可直接复制完整 key 并在创建后自动刷新定位新行、中文 label 不再生成 `sk--key-`、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（29 条断言，真实 `node:sqlite`） |
 | **0.1.8** | **修「登录成功却说没凭据」**：`catalog()` 以前会把 `MISSING_CREDENTIAL` 一起缓存 5 分钟（`CATALOG_RETRY_MS`）。全新安装时启动预拉取先失败一次，随后 `/trae-login` 成功，模型选择器却在窗口内继续重放那条缓存错误 —— 页面上就是「Trae CN 加载失败：no Trae CN credentials」，尽管 `~/.trae-proxy/credentials.json` 已经写好。现在**凭据类错误一律不缓存**（`MISSING_CREDENTIAL` / `REFRESH_FAILED` / `AUTH`），且 `/trae-login` 成功后调用 `adapter.invalidateCatalog()` 清空目录并立即预热，登录即刻生效。两条回归测试锁住 |
 | **0.1.7** | **企业账号 4008 修复**：企业流量必须打租户网关（凭据里的 `saasBootConfig.apiHost`，如 `console.enterprise.trae.cn`），且请求体必须带 `session_id`，否则消费版网关会按个人积分结算并回 `4008`——即使企业席位额度还有 ¥300。现在 `apiHostFor()` 自动选网关、`session_id`/`conversation_id` 固定随请求发送，企业控制台也能按会话看到用量。另加额度可观测：① 只读 `trae-cn usage`（`npm run usage`）查询 `web_user_ent_usage`，不消耗积分；② `notify_usage` 不再被当成 token usage；③ `4008` 带 `ide_credits`/`work_credits`/`billing_mode` 并被 DSH 归类为 `QUOTA`。文档新增「额度与用量（4008 排错）」 |
 | **0.1.6** | 安全加固，来自 dsh.so 动态审计的两条发现：① `/v1` 默认不再下发 `Access-Control-Allow-Origin: *`，带 `Origin` 头的请求一律 `403`（新增 `allowBrowserOrigins` 白名单）—— 以前任意网页都能用你的 Trae 额度；② `login-debug.log` 落盘前对回调参数脱敏，`userJwt` / `refreshToken` / `userInfo` 等敏感值替换成 `<redacted N>` —— 以前令牌会被复制到凭据文件之外。两条都有回归测试锁住 |

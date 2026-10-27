@@ -439,11 +439,62 @@ export class GatewayStore {
    * The most recent requests, newest first.
    * @param {{ limit?: number, keyId?: string, label?: string }} [options]
    */
-  recent({ limit = 100, keyId = null, label = null } = {}) {
+  recent({ limit = 100, keyId = null, label = null, since = null, until = null } = {}) {
     const capped = Math.min(1000, Math.max(1, Number(limit) || 100));
-    if (keyId) return this.db.prepare('SELECT * FROM usage WHERE key_id = ? ORDER BY ts DESC, id DESC LIMIT ?').all(keyId, capped).map(plainRow);
-    if (label) return this.db.prepare('SELECT * FROM usage WHERE key_label = ? ORDER BY ts DESC, id DESC LIMIT ?').all(label, capped).map(plainRow);
-    return this.db.prepare('SELECT * FROM usage ORDER BY ts DESC, id DESC LIMIT ?').all(capped).map(plainRow);
+    // Filters are assembled rather than branched on, so the growing parameter
+    // list stays readable: every supplied filter narrows the same query.
+    const where = [];
+    const params = [];
+    if (keyId) {
+      where.push('key_id = ?');
+      params.push(keyId);
+    }
+    if (label) {
+      where.push('key_label = ?');
+      params.push(label);
+    }
+    if (since !== null && since !== undefined) {
+      where.push('ts >= ?');
+      params.push(Number(since));
+    }
+    if (until !== null && until !== undefined) {
+      where.push('ts < ?');
+      params.push(Number(until));
+    }
+    const sql =
+      `SELECT * FROM usage ${where.length ? `WHERE ${where.join(' AND ')}` : ''}` +
+      ' ORDER BY ts DESC, id DESC LIMIT ?';
+    return this.db.prepare(sql).all(...params, capped).map(plainRow);
+  }
+
+  /**
+   * Per-day totals for a window, oldest first. Days with no traffic are emitted
+   * with zeros rather than skipped, so a chart shows the gaps instead of
+   * compressing a quiet week into a misleadingly dense line.
+   * @param {{ since: number, until: number }} window - epoch seconds.
+   * @param {number} [offsetSeconds] - the viewer's UTC offset, so "a day" is
+   *   the operator's local day and matches what `startOfToday` uses.
+   */
+  daily({ since, until, offsetSeconds = -new Date().getTimezoneOffset() * 60 } = {}) {
+    const rows = this.db
+      .prepare(
+        `SELECT CAST((ts + ?) / 86400 AS INTEGER) * 86400 - ? AS day,
+                COALESCE(SUM(total_tokens), 0) AS tokens,
+                COUNT(*) AS requests
+           FROM usage
+          WHERE ts >= ? AND ts < ?
+       GROUP BY day
+       ORDER BY day ASC`,
+      )
+      .all(offsetSeconds, offsetSeconds, Number(since), Number(until));
+    const byDay = new Map(rows.map((r) => [Number(r.day), { tokens: Number(r.tokens), requests: Number(r.requests) }]));
+    const out = [];
+    const start = Math.floor((Number(since) + offsetSeconds) / 86400) * 86400 - offsetSeconds;
+    for (let day = start; day < Number(until); day += 86400) {
+      const bucket = byDay.get(day) ?? { tokens: 0, requests: 0 };
+      out.push({ day, ...bucket });
+    }
+    return out;
   }
 
   /** Wipe every usage row. Used by tests and by an explicit admin reset. */
