@@ -935,6 +935,7 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.2** | **仅文档与元数据**：0.2.1 的 tarball 里 README/SECURITY 仍是 0.1.8 的内容（文档在发布之后才补），npm 不允许覆盖已发布版本，故提一个补丁版把「三种接入方式」、网关模式说明与 SECURITY 的 Gateway mode 一节一并带上。代码与 0.2.1 完全一致 |
 | **0.2.1** | **修「官方 SDK 拿不到回复」**：`stream` 缺省时服务返回 SSE，而 OpenAI 规范（以及官方 Python/Node 客户端）默认期望一次性 JSON —— 客户端把 SSE 正文当 JSON 解析，表现为 `choices` 为 `undefined` / 没有 content。现在只有显式 `stream: true` 才流式。另一处：`--default-model` 让省略 model 的请求不再落到目录首位的 `Doubao-Seed-Evolving`。均有回归测试 |
 | **0.2.0** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 存哈希 + 明文 / usage / quota_snapshots，旧库自动补 `secret` 列）、`keys show` 子命令、管理页可直接复制完整 key 并在创建后自动刷新定位新行、中文 label 不再生成 `sk--key-`、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（25 条断言，真实 `node:sqlite`） |
 | **0.1.8** | **修「登录成功却说没凭据」**：`catalog()` 以前会把 `MISSING_CREDENTIAL` 一起缓存 5 分钟（`CATALOG_RETRY_MS`）。全新安装时启动预拉取先失败一次，随后 `/trae-login` 成功，模型选择器却在窗口内继续重放那条缓存错误 —— 页面上就是「Trae CN 加载失败：no Trae CN credentials」，尽管 `~/.trae-proxy/credentials.json` 已经写好。现在**凭据类错误一律不缓存**（`MISSING_CREDENTIAL` / `REFRESH_FAILED` / `AUTH`），且 `/trae-login` 成功后调用 `adapter.invalidateCatalog()` 清空目录并立即预热，登录即刻生效。两条回归测试锁住 |
