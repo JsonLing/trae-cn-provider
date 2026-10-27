@@ -718,6 +718,7 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
+| **0.1.8** | **修「登录成功却说没凭据」**：`catalog()` 以前会把 `MISSING_CREDENTIAL` 一起缓存 5 分钟（`CATALOG_RETRY_MS`）。全新安装时启动预拉取先失败一次，随后 `/trae-login` 成功，模型选择器却在窗口内继续重放那条缓存错误 —— 页面上就是「Trae CN 加载失败：no Trae CN credentials」，尽管 `~/.trae-proxy/credentials.json` 已经写好。现在**凭据类错误一律不缓存**（`MISSING_CREDENTIAL` / `REFRESH_FAILED` / `AUTH`），且 `/trae-login` 成功后调用 `adapter.invalidateCatalog()` 清空目录并立即预热，登录即刻生效。两条回归测试锁住 |
 | **0.1.7** | **企业账号 4008 修复**：企业流量必须打租户网关（凭据里的 `saasBootConfig.apiHost`，如 `console.enterprise.trae.cn`），且请求体必须带 `session_id`，否则消费版网关会按个人积分结算并回 `4008`——即使企业席位额度还有 ¥300。现在 `apiHostFor()` 自动选网关、`session_id`/`conversation_id` 固定随请求发送，企业控制台也能按会话看到用量。另加额度可观测：① 只读 `trae-cn usage`（`npm run usage`）查询 `web_user_ent_usage`，不消耗积分；② `notify_usage` 不再被当成 token usage；③ `4008` 带 `ide_credits`/`work_credits`/`billing_mode` 并被 DSH 归类为 `QUOTA`。文档新增「额度与用量（4008 排错）」 |
 | **0.1.6** | 安全加固，来自 dsh.so 动态审计的两条发现：① `/v1` 默认不再下发 `Access-Control-Allow-Origin: *`，带 `Origin` 头的请求一律 `403`（新增 `allowBrowserOrigins` 白名单）—— 以前任意网页都能用你的 Trae 额度；② `login-debug.log` 落盘前对回调参数脱敏，`userJwt` / `refreshToken` / `userInfo` 等敏感值替换成 `<redacted N>` —— 以前令牌会被复制到凭据文件之外。两条都有回归测试锁住 |
 | 0.1.5 | 文档为主：新增「让别的 agent 框架也用上（以 Hermes 为例）」的完整接法与排错 —— DSH 宿主端口每次启动都会变、桌面端输入框的模型选择是粘性的、`fallback_providers` 必须是 YAML 列表（写成 JSON 字符串会被静默忽略）；补 LaunchAgent 常驻写法。运行时行为与 0.1.4 一致 |
