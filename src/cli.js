@@ -108,21 +108,65 @@ async function cmdModels() {
   }
 }
 
+/** Where the gateway config lives by default (next to the database). */
+export const DEFAULT_CONFIG = path.join(CRED_DIR, 'gateway.json');
+
+/**
+ * Read a JSON config file, if present.
+ *
+ * The point of this indirection is that a one-click npm script cannot carry a
+ * `--admin-password`: `package.json` is committed, and an operator's admin
+ * password in a tracked file is a credential leak waiting for a `git push`.
+ * Flags still win over the file, so `npm run gateway -- --port 9000` works.
+ * @param {string} file
+ * @returns {object}
+ */
+function readConfig(file, { required = false } = {}) {
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('配置必须是 JSON 对象');
+    }
+    return parsed;
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      // An *explicit* `--config` must exist: silently falling back to
+      // single-user mode because of a typo would start a different service
+      // than the one asked for. The default path may be absent, which is how
+      // a plain `serve` keeps its historical loopback behaviour.
+      if (required) {
+        throw new Error(
+          `配置文件不存在: ${file}\n  先运行: npm run gateway:init -- --admin-password '你的口令'`,
+        );
+      }
+      return {};
+    }
+    if (err instanceof SyntaxError) throw new Error(`配置不是合法 JSON (${file}): ${err.message}`);
+    throw new Error(`读取配置失败 (${file}): ${err.message}`);
+  }
+}
+
 async function cmdServe() {
   const { flags } = parseArgs(process.argv.slice(3));
-  const port = Number(flags.port ?? process.env.PORT ?? 8317);
-  const host = String(flags.host ?? process.env.HOST ?? '127.0.0.1');
-  const apiKey = flags['api-key'] ?? process.env.API_KEY ?? null;
-  const adminPassword = flags['admin-password'] ?? process.env.ADMIN_PASSWORD ?? null;
+  const explicitConfig = typeof flags.config === 'string';
+  const configFile = explicitConfig ? path.resolve(flags.config) : DEFAULT_CONFIG;
+  const config = readConfig(configFile, { required: explicitConfig });
+
+  const port = Number(flags.port ?? process.env.PORT ?? config.port ?? 8317);
+  const host = String(flags.host ?? process.env.HOST ?? config.host ?? '127.0.0.1');
+  const apiKey = flags['api-key'] ?? process.env.API_KEY ?? config.apiKey ?? null;
+  const adminPassword = flags['admin-password'] ?? process.env.ADMIN_PASSWORD ?? config.adminPassword ?? null;
 
   // Gateway mode is opt-in: `--db` (with or without a path) turns on the key
   // table, the daily caps and the usage ledger. Without it `serve` behaves
   // exactly as before — one optional `--api-key`, no database — so an existing
   // single-user setup keeps working after an upgrade.
-  const gateway = Boolean(flags.db || flags.gateway);
+  const gateway = Boolean(flags.db || flags.gateway || config.db);
   let store = null;
   if (gateway) {
-    const file = typeof flags.db === 'string' ? path.resolve(flags.db) : DEFAULT_DB;
+    const dbFlag = typeof flags.db === 'string' ? flags.db : typeof config.db === 'string' ? config.db : null;
+    const file = dbFlag ? path.resolve(dbFlag) : DEFAULT_DB;
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     try {
       store = openStore(file);
@@ -267,17 +311,36 @@ async function cmdUsage() {
   console.log(formatQuota(snapshot, { ...tenantOf(creds.token), username: creds.username || '' }));
 }
 
+/**
+ * Resolve the gateway database path from a `--db` flag, then the config file,
+ * then the default. `keys` and `report` share this so an operator who points
+ * `serve` at a custom database does not silently manage a different one.
+ * @param {object} flags - parsed CLI flags.
+ */
+function resolveDb(flags) {
+  if (typeof flags.db === 'string') return path.resolve(flags.db);
+  const configFile = typeof flags.config === 'string' ? path.resolve(flags.config) : DEFAULT_CONFIG;
+  try {
+    const config = readConfig(configFile);
+    if (typeof config.db === 'string' && config.db) return path.resolve(config.db);
+  } catch {
+    /* an unreadable config is reported by `serve`; here the default is fine */
+  }
+  return DEFAULT_DB;
+}
+
 /** `keys add|list|rm|enable|disable|limit` — the operator's key management. */
 async function cmdKeys() {
   const { flags, positional } = parseArgs(process.argv.slice(3));
   const action = positional[0] || 'list';
-  const file = typeof flags.db === 'string' ? path.resolve(flags.db) : DEFAULT_DB;
+  const file = resolveDb(flags);
   let store;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     store = openStore(file);
   } catch (err) {
     console.error(`无法打开数据库 ${file}: ${err.message}`);
+    console.error(`  可加 --db <path> 指定别的位置，或先 npm run gateway:init 写好配置。`);
     process.exit(1);
   }
 
@@ -411,12 +474,13 @@ function findKey(store, needle) {
 async function cmdReport() {
   const { flags } = parseArgs(process.argv.slice(3));
   const days = Math.max(1, Math.min(90, Number(flags.days ?? 1) || 1));
-  const file = typeof flags.db === 'string' ? path.resolve(flags.db) : DEFAULT_DB;
+  const file = resolveDb(flags);
   let store;
   try {
     store = openStore(file);
   } catch (err) {
     console.error(`无法打开数据库 ${file}: ${err.message}`);
+    console.error(`  可加 --db <path> 指定别的位置，或先 npm run gateway:init 写好配置。`);
     process.exit(1);
   }
 
@@ -500,6 +564,83 @@ async function cmdReport() {
   }
 }
 
+/**
+ * `init` — write the gateway config file that the one-click npm scripts read.
+ *
+ * Deliberately interactive about the admin password: generating one and
+ * printing it is how the current running instance was set up, but a password
+ * that only ever appeared in a terminal scrollback is easily lost. Here the
+ * operator sets it, and the file is written 0600.
+ */
+async function cmdInit() {
+  const { flags } = parseArgs(process.argv.slice(3));
+  const configFile = typeof flags.config === 'string' ? path.resolve(flags.config) : DEFAULT_CONFIG;
+  const host = String(flags.host ?? '0.0.0.0');
+  const port = Number(flags.port ?? 8317);
+  const dbFlag = typeof flags.db === 'string' ? flags.db : path.join(CRED_DIR, 'gateway.db');
+  const adminPassword = typeof flags['admin-password'] === 'string' ? flags['admin-password'] : null;
+
+  if (fs.existsSync(configFile) && !flags.force) {
+    console.error(`${configFile} 已存在。要覆盖请加 --force。`);
+    console.error('当前配置：');
+    console.error(JSON.stringify(readConfig(configFile), null, 2));
+    process.exit(1);
+  }
+
+  // Secrets never go to stdout: only whether one was set.
+  if (!adminPassword) {
+    console.error(
+      '需要 --admin-password <口令>：这个文件会被 npm 脚本读取，口令必须由你指定，不能自动生成。\n' +
+        '  例：node src/cli.js init --admin-password \'你的口令\'',
+    );
+    process.exit(1);
+  }
+
+  const config = { host, port, db: path.resolve(dbFlag), adminPassword };
+  fs.mkdirSync(path.dirname(configFile), { recursive: true, mode: 0o700 });
+  const temp = `${configFile}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temp, configFile);
+  fs.chmodSync(configFile, 0o600);
+
+  console.log(`已写入 ${configFile}（0600，含口令，不要提交）`);
+  console.log(`  host: ${config.host}`);
+  console.log(`  port: ${config.port}`);
+  console.log(`  db  : ${config.db}`);
+  console.log('  adminPassword: (已设置)');
+  console.log('');
+  console.log('下一步: npm run gateway');
+}
+
+/** `stop` — find and terminate the gateway process holding the configured port. */
+async function cmdStop() {
+  const { flags } = parseArgs(process.argv.slice(3));
+  const configFile = typeof flags.config === 'string' ? path.resolve(flags.config) : DEFAULT_CONFIG;
+  const config = readConfig(configFile);
+  const port = Number(flags.port ?? config.port ?? 8317);
+  const { execFileSync } = await import('node:child_process');
+  let pids = [];
+  try {
+    const out = execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' });
+    pids = out.split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch {
+    console.log(`端口 ${port} 上没有监听进程。`);
+    return;
+  }
+  if (!pids.length) {
+    console.log(`端口 ${port} 上没有监听进程。`);
+    return;
+  }
+  for (const pid of pids) {
+    try {
+      process.kill(Number(pid), 'SIGTERM');
+      console.log(`已停止 pid ${pid}（端口 ${port}）`);
+    } catch (err) {
+      console.error(`停止 pid ${pid} 失败: ${err.message}`);
+    }
+  }
+}
+
 const commands = {
   login: cmdLogin,
   models: cmdModels,
@@ -509,16 +650,22 @@ const commands = {
   keys: cmdKeys,
   report: cmdReport,
   'usage-report': cmdReport,
+  init: cmdInit,
+  stop: cmdStop,
 };
 
 const command = process.argv[2];
 if (!commands[command]) {
-  console.log('用法: node src/cli.js <login|models|serve|chat|usage|keys|report>');
+  console.log('用法: node src/cli.js <login|models|init|serve|stop|chat|usage|keys|report>');
   console.log('');
   console.log('  login                  浏览器登录 Trae 账号');
   console.log('  models                 列出可用模型');
-  console.log('  serve [--host 0.0.0.0] [--db] [--admin-password <pw>]');
+  console.log('  init [--admin-password <pw>] [--host 0.0.0.0] [--port 8317]');
+  console.log('                         生成 npm run gateway 用的配置（0600）');
+  console.log('  serve [--host 0.0.0.0] [--db] [--admin-password <pw>] [--config <file>]');
   console.log('                         启动 OpenAI 兼容服务；--db 开启多 key + 记账');
+  console.log(`                         配置默认读 ${DEFAULT_CONFIG}（npm run gateway 用）`);
+  console.log('  stop                   停止占用配置端口的网关进程');
   console.log('  keys add <label> [--limit N]   创建一把 key（只显示一次）');
   console.log('  keys list              查看 key 与今日用量');
   console.log('  keys rm|enable|disable <label>');

@@ -208,6 +208,38 @@ curl -N http://10.255.47.198:8317/v1/chat/completions \
 - 忘了就把旧 key `keys rm` 掉，重新 `keys add`；
 - 泄漏了同样处理，`keys disable <label>` 立即生效，不需要重启。
 
+### 一键命令（`package.json`）
+
+日常最常用的几件事已预置成 npm 脚本：不加参数就是默认行为。
+
+| 命令 | 作用 |
+|---|---|
+| `npm run gateway:init -- --admin-password '口令'` | 首次配置，写 `~/.trae-proxy/gateway.json`（0600） |
+| `npm run gateway` | 按该配置启动 b2b 网关（读 host / port / db / 口令） |
+| `npm run gateway:local` | 不写配置文件、用本仓库 `.gateway/gateway.db`，口令取 `$ADMIN_PASSWORD` |
+| `npm run gateway:stop` | 停掉配置端口上的网关进程 |
+| `npm run keys` | 查看 key 与今日用量 |
+| `npm run keys:add -- 张三 --limit 200000` | 建一把 key（完整值只打印一次） |
+| `npm run report` / `npm run report:7d` | 按人汇总用量（今日 / 近七天） |
+
+**为什么口令不写进 `package.json`：** 那个文件是要提交的。所以 `gateway` 从
+`~/.trae-proxy/gateway.json`（0600，已在 `.gitignore` 之外且不在仓库里）读口令，
+`gateway:local` 从环境变量 `ADMIN_PASSWORD` 读；两者都缺时**直接报错并给出修复提示**，
+不会悄悄用空口令起来。
+
+```bash
+# 首次（写配置，口令持久化在 0600 文件里）
+npm run gateway:init -- --admin-password '你的口令'
+npm run gateway
+
+# 或者完全不落盘（口令只存在于当前 shell）
+export ADMIN_PASSWORD='你的口令'
+npm run gateway:local
+```
+
+`--config` 指向的文件必须存在：写错路径会立刻报错，而不是静默退化成单用户模式
+（那会启动一个你以为不是的东西）。
+
 ### 三个命令够日常用
 
 ```bash
