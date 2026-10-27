@@ -26,6 +26,7 @@ macOS 优先、源码可审计、**凭据不出本机**。
 - 支持**图片输入**（多模态模型）：DSH 的图片块经 attachments 缝内联为 data URL；OpenAI 层也接受 `image_url`
 - 可选：在宿主已有的 web server 上挂一个 OpenAI 兼容面（`/v1/models`、`/v1/chat/completions`），**不自己占用端口**
 - 同时提供一个独立 CLI，可脱离 DSH 单独当本地代理跑
+- **可选网关模式（0.2.0 起）**：把同一个账号按人分发——每人一把 key、可设每日 token 上限、按人记账，并自带一个 `/admin` 管理页
 
 ## 它不做什么
 
