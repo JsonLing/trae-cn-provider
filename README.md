@@ -150,7 +150,8 @@ https://www.trae.cn/authorization?...&auth_callback_url=http://127.0.0.1:<port>/
 | POST | `/trae-cn/v1/chat/completions` | 对话（流式 / 非流式，含 `reasoning_content` 与 tool calls） |
 | GET | `/trae-cn/health` | 健康检查 |
 
-独立 CLI 也可以把同样的接口跑在自有端口上。注意独立进程的路径**没有** `/trae-cn` 前缀，直接就是 `/v1/...`：
+独立 CLI 也可以把同样的接口跑在自有端口上。注意独立进程的路径**没有** `/trae-cn` 前缀，直接就是 `/v1/...`
+（三种——DSH 内置 / 本地 serve / b2b 网关——的完整对照见后面的「三种接入方式」）：
 
 ```bash
 node src/cli.js login     # 浏览器登录
@@ -725,44 +726,107 @@ npx -p @jieai/dsh-plugin-vet vet-gate --package node_modules/trae-cn-provider
 
 ---
 
+## 三种接入方式（先选对，接错是最高频的失败原因）
+
+同一个账号、同一份凭据，但**对外暴露的形态有三种**。它们的地址、鉴权、记账能力都不同，
+混用是绝大多数「能看到模型但一发消息就失败」或「记录对不上」的根源。
+
+| | A · DSH 内置 | B · 本地 serve | C · b2b 网关 |
+|---|---|---|---|
+| 启动 | DSH 自动挂载 | `npm run serve` | `npm run gateway` |
+| Base URL | `http://127.0.0.1:<DSH 端口>/trae-cn/v1` | `http://127.0.0.1:8317/v1` | `http://<内网IP>:8317/v1` |
+| 端口稳定 | ❌ 每次重启都变 | ✅ | ✅ |
+| API Key | **不校验**（占位符即可） | 可选单一 key | **必须真实存在于数据库** |
+| 谁能连 | 仅本机 | 仅本机（默认回环） | 局域网 |
+| 按人记账 | ❌ | ❌ | ✅ |
+| 管理页 `/admin` | ❌ | ❌ | ✅ |
+
+### A · DSH 内置（给 DSH 自己用）
+
+装好插件后 DSH 会自动把 `/trae-cn/v1` 挂到它自己的 web 端口上，**不需要任何额外启动步骤**。
+模型选择器里直接出现 Trae 的模型，这就是日常在 DSH 对话框里说话时走的路。
+
+```bash
+# 查当前端口（每次启动都变，别写死）
+lsof -nP -iTCP -sTCP:LISTEN | grep DeepSeek
+```
+
+这个端点**不校验 API Key**：插件在这里只服务本机，没有配置 `store`，鉴权分支会整体短路。
+所以 `api_key: trae-local` 这类占位符能通过，不传也能通过。
+
+### B · 本地 serve（固定端口，给本机其它工具用）
+
+```bash
+npm run serve -- --port 8317
+# 或：node src/cli.js serve --port 8317
+```
+
+默认只监听 `127.0.0.1`，不带 `--db` 时**没有 key 表、没有记账、没有管理页**，
+行为与网关模式出现之前完全一致。需要单一共享口令时加 `--api-key`。
+
+### C · b2b 网关（分发给同事，按人记账）
+
+见上一节「网关模式」。要点：`--host 0.0.0.0` + `--db` + `--admin-password`，
+key 由 `keys add` 或 `/admin` 生成，每个同事一把。
+
+---
+
 ## 让别的 agent 框架也用上（以 Hermes 为例）
 
 插件对外提供的是**标准 OpenAI 兼容端点**（`/v1/models` + `/v1/chat/completions`），任何支持自定义 OpenAI 端点的框架都能直接接入，**不需要改插件、也不需要第二次登录**。
 
-它有**两种暴露方式，端口和路径都不一样**，接错是最常见的失败原因：
+**推荐走 C（b2b 网关）**：端口固定、有真 key、调用进账本。Hermes 侧：
 
-| 方式 | Base URL | 端口稳定性 |
-|---|---|---|
-| DSH 宿主挂载（`mountOpenAIEndpoint: true`，默认） | `http://127.0.0.1:<DSH Web 端口>/trae-cn/v1` | ❌ DSH 桌面端每次启动都换端口 |
-| 独立进程 `node src/cli.js serve --port 8317` | `http://127.0.0.1:8317/v1` | ✅ 端口固定 |
+```yaml
+model:
+  provider: trae
+  base_url: "http://10.255.47.198:8317/v1"   # C：内网 IP + 固定端口
+  api_key: "sk-key-…"                        # C：真实的 key，不是占位符
+  api_mode: chat_completions
+  default: DeepSeek-V4.1-Flash-1017
 
-> ⚠️ **不要照抄具体端口号。** DSH 的 Web 端口是每次启动重新分配的（本机实测：`19387` → `54865` → `50455`，每次重启都换一个，旧端口上不再有进程监听）。同时独立进程的路径里**没有** `/trae-cn` 前缀。写死错的组合时表现就是：Hermes 能启动、模型列表也能看到，但一发消息就失败。
-
-**推荐的接法：用独立进程 + 固定端口。** 它不依赖 DSH 是否在跑，DSH 重启也不受影响：
-
-```bash
-node src/cli.js serve --port 8317          # 常驻，打印 http://127.0.0.1:8317/v1
-curl -s http://127.0.0.1:8317/v1/models | head -c 200   # 自检：应返回 20 个模型
+fallback_providers:
+  - provider: trae
+    model: glm-5.3-flash
+    base_url: http://10.255.47.198:8317/v1
+    api_key: sk-key-…
 ```
 
-然后改 `~/.hermes/config.yaml`：
+**也可以走 B（本地 serve）**，此时端点无鉴权，`api_key` 填任意非空字符串：
 
 ```yaml
 model:
   provider: trae
   base_url: "http://127.0.0.1:8317/v1"
-  api_key: "trae-local"        # 端点仅监听 127.0.0.1 且无鉴权，非空即可
+  api_key: "trae-local"        # B：端点无鉴权，非空即可
   api_mode: chat_completions
   default: glm-5.3
-
-providers:
-  trae:
-    base_url: "http://127.0.0.1:8317/v1"
-    api_key: "trae-local"
-    default_model: "glm-5.3"
 ```
 
-实测：Hermes 把它解析为自定义端点（`api_mode: chat_completions`），20 个模型全部可见，流式 / 非流式 / function calling 均可用。
+**不推荐走 A**：`127.0.0.1:<DSH端口>/trae-cn/v1` 虽然能通，但 DSH 每次重启端口都变，
+写死就会频繁 `Connection error`（实测 `19387` → `54865` → `50455` → `56672`）：
+
+```
+WARNING provider=custom base_url=http://127.0.0.1:19387/trae-cn/v1
+  model=glm-5.3 summary=Connection error. (attempt 1/3, 2/3, 3/3)
+```
+
+> ⚠️ **路径前缀也跟着方式走。** A 带 `/trae-cn`，B/C **没有**。`base_url` 写错端口或前缀时，
+> 表现是「模型列表能看到，但一发消息就失败」——这是最难自查的一类。
+
+实测（C 方式）：Hermes 解析为自定义端点（`api_mode: chat_completions`），23 个模型全部可见，
+流式 / 非流式 / function calling 均可用，且每次调用都记入 `/admin` 的账本。
+
+### 三种方式的鉴权差异（容易踩）
+
+| 方式 | `api_key` 填错会怎样 |
+|---|---|
+| A | **无所谓**，根本不校验 |
+| B | 未设 `--api-key` 时无所谓；设了则 401 |
+| C | **立刻 401**，且会在账本里留一行 `unknown` 记录 |
+
+所以从 B/A 切到 C 时，**必须同步换 key** —— 旧配置里的 `trae-local` 会被拒绝。
+同理，如果哪天在 `/admin` 停用了某把 key，用它的 Hermes 会立刻开始 401。
 
 两个前提：
 
@@ -870,7 +934,7 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
-| **未发布** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 存哈希 + 明文 / usage / quota_snapshots，旧库自动补 `secret` 列）、`keys show` 子命令、管理页可直接复制完整 key 并在创建后自动刷新定位新行、中文 label 不再生成 `sk--key-`、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（25 条断言，真实 `node:sqlite`） |
+| **0.2.0** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 存哈希 + 明文 / usage / quota_snapshots，旧库自动补 `secret` 列）、`keys show` 子命令、管理页可直接复制完整 key 并在创建后自动刷新定位新行、中文 label 不再生成 `sk--key-`、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（25 条断言，真实 `node:sqlite`） |
 | **0.1.8** | **修「登录成功却说没凭据」**：`catalog()` 以前会把 `MISSING_CREDENTIAL` 一起缓存 5 分钟（`CATALOG_RETRY_MS`）。全新安装时启动预拉取先失败一次，随后 `/trae-login` 成功，模型选择器却在窗口内继续重放那条缓存错误 —— 页面上就是「Trae CN 加载失败：no Trae CN credentials」，尽管 `~/.trae-proxy/credentials.json` 已经写好。现在**凭据类错误一律不缓存**（`MISSING_CREDENTIAL` / `REFRESH_FAILED` / `AUTH`），且 `/trae-login` 成功后调用 `adapter.invalidateCatalog()` 清空目录并立即预热，登录即刻生效。两条回归测试锁住 |
 | **0.1.7** | **企业账号 4008 修复**：企业流量必须打租户网关（凭据里的 `saasBootConfig.apiHost`，如 `console.enterprise.trae.cn`），且请求体必须带 `session_id`，否则消费版网关会按个人积分结算并回 `4008`——即使企业席位额度还有 ¥300。现在 `apiHostFor()` 自动选网关、`session_id`/`conversation_id` 固定随请求发送，企业控制台也能按会话看到用量。另加额度可观测：① 只读 `trae-cn usage`（`npm run usage`）查询 `web_user_ent_usage`，不消耗积分；② `notify_usage` 不再被当成 token usage；③ `4008` 带 `ide_credits`/`work_credits`/`billing_mode` 并被 DSH 归类为 `QUOTA`。文档新增「额度与用量（4008 排错）」 |
 | **0.1.6** | 安全加固，来自 dsh.so 动态审计的两条发现：① `/v1` 默认不再下发 `Access-Control-Allow-Origin: *`，带 `Origin` 头的请求一律 `403`（新增 `allowBrowserOrigins` 白名单）—— 以前任意网页都能用你的 Trae 额度；② `login-debug.log` 落盘前对回调参数脱敏，`userJwt` / `refreshToken` / `userInfo` 等敏感值替换成 `<redacted N>` —— 以前令牌会被复制到凭据文件之外。两条都有回归测试锁住 |
