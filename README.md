@@ -203,10 +203,15 @@ curl -N http://10.255.47.198:8317/v1/chat/completions \
 **key 由你自己生成，与 Trae 无关。** Trae 侧那枚凭据（`~/.trae-proxy/credentials.json`）是给上游验身的，
 永远不该发给别人。发给同事的 `sk-<label>-<32 hex>` 由 `keys add` 或管理页生成，只与本地数据库核对。
 
-数据库里**只存 SHA-256**，明文只在创建的那一刻打印一次，之后无法再读出。所以：
+数据库里保存了**完整 key 和它的 SHA-256**：鉴权只读哈希，明文供管理员随时查看
+（管理页 `/admin` 或 `node src/cli.js keys show`）。这样分发后忘了发给谁、或对方丢了 key，
+不用重新签发一轮。
 
-- 忘了就把旧 key `keys rm` 掉，重新 `keys add`；
-- 泄漏了同样处理，`keys disable <label>` 立即生效，不需要重启。
+代价要说清楚：**能读 `gateway.db` 的人就能读到所有 key**。该文件 0600，管理页有自己的口令，
+所以实际暴露面与旁边的凭据文件相同。
+
+- 泄漏了就 `keys disable <label>`，立即生效，不需要重启；
+- 彻底作废用 `keys rm <label>`（历史用量仍保留在报告里）。
 
 ### 一键命令（`package.json`）
 
@@ -535,7 +540,7 @@ smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**�
 - `smoke-plugin.js` — **插件入口 `apply()`**：Config 是否是可被 cordis 校验的 Standard Schema、provider/adapter 是否按契约注册、挂载的 OpenAI 接口是否真的能应答，以及 **`prepareCall().stream()` 同步返回 AsyncIterable**（防 `[Symbol.asyncIterator] is not a function` 回归）
 - `smoke-quota.js` — 额度快照与 4008：摘要解析、405/business-code 报错、`formatQuota` 的零余额提示，以及 `4008` 的错误消息里必须带上 `notify_usage` 的额度
 - `smoke-login.js` — **`/trae-login` 命令全链路**：命令注册 → `webLogin` → 授权链接 → **合成 Trae 的真实回调** → 凭据落盘。它把 `openInApp` 换成桩（否则会真的弹出浏览器），并用 `TRAE_PROXY_CRED_DIR` 隔离凭据文件，**不会碰你真实的登录态**
-- `smoke-gateway.js` — **网关模式**：key 只以 SHA-256 落盘、停用与未知 key 可区分、日上限的边界（100/100 即触顶、被拒的请求不占额度、中断的请求占额度）、删 key 后历史用量仍在、**流式多 chunk 只写一行**、4008 记为 `upstream_error`、超限在**读请求体之前**就 429、中途断开记为 `aborted`、管理页鉴权与 `/v1` key 完全分离、跨站 POST 被拒，以及无 store 时仍退回单 key 模式。它用真实 `node:sqlite`（内存或临时文件）跑出真实 SQL，只 mock 上游 fetch
+- `smoke-gateway.js` — **网关模式**：key 的哈希鉴权与明文回读、旧库自动迁移（补 `secret` 列）、中文 label 仍生成 `sk-<stem>-` 形状、停用与未知 key 可区分、日上限的边界（100/100 即触顶、被拒的请求不占额度、中断的请求占额度）、删 key 后历史用量仍在、**流式多 chunk 只写一行**、4008 记为 `upstream_error`、超限在**读请求体之前**就 429、中途断开记为 `aborted`、管理页鉴权与 `/v1` key 完全分离、跨站 POST 被拒，以及无 store 时仍退回单 key 模式。它用真实 `node:sqlite`（内存或临时文件）跑出真实 SQL，只 mock 上游 fetch
 
 另有两个**需要联网的手动脚本**（不在 `npm run check` 里）：
 
@@ -848,7 +853,7 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
-| **未发布** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 只存 SHA-256 / usage / quota_snapshots）、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（23 条断言，真实 `node:sqlite`） |
+| **未发布** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 存哈希 + 明文 / usage / quota_snapshots，旧库自动补 `secret` 列）、`keys show` 子命令、管理页可直接复制完整 key 并在创建后自动刷新定位新行、中文 label 不再生成 `sk--key-`、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（25 条断言，真实 `node:sqlite`） |
 | **0.1.8** | **修「登录成功却说没凭据」**：`catalog()` 以前会把 `MISSING_CREDENTIAL` 一起缓存 5 分钟（`CATALOG_RETRY_MS`）。全新安装时启动预拉取先失败一次，随后 `/trae-login` 成功，模型选择器却在窗口内继续重放那条缓存错误 —— 页面上就是「Trae CN 加载失败：no Trae CN credentials」，尽管 `~/.trae-proxy/credentials.json` 已经写好。现在**凭据类错误一律不缓存**（`MISSING_CREDENTIAL` / `REFRESH_FAILED` / `AUTH`），且 `/trae-login` 成功后调用 `adapter.invalidateCatalog()` 清空目录并立即预热，登录即刻生效。两条回归测试锁住 |
 | **0.1.7** | **企业账号 4008 修复**：企业流量必须打租户网关（凭据里的 `saasBootConfig.apiHost`，如 `console.enterprise.trae.cn`），且请求体必须带 `session_id`，否则消费版网关会按个人积分结算并回 `4008`——即使企业席位额度还有 ¥300。现在 `apiHostFor()` 自动选网关、`session_id`/`conversation_id` 固定随请求发送，企业控制台也能按会话看到用量。另加额度可观测：① 只读 `trae-cn usage`（`npm run usage`）查询 `web_user_ent_usage`，不消耗积分；② `notify_usage` 不再被当成 token usage；③ `4008` 带 `ide_credits`/`work_credits`/`billing_mode` 并被 DSH 归类为 `QUOTA`。文档新增「额度与用量（4008 排错）」 |
 | **0.1.6** | 安全加固，来自 dsh.so 动态审计的两条发现：① `/v1` 默认不再下发 `Access-Control-Allow-Origin: *`，带 `Origin` 头的请求一律 `403`（新增 `allowBrowserOrigins` 白名单）—— 以前任意网页都能用你的 Trae 额度；② `login-debug.log` 落盘前对回调参数脱敏，`userJwt` / `refreshToken` / `userInfo` 等敏感值替换成 `<redacted N>` —— 以前令牌会被复制到凭据文件之外。两条都有回归测试锁住 |

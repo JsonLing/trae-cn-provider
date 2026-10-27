@@ -10,7 +10,7 @@ import { webLogin } from './trae-auth.js';
 import { chat } from './trae-client.js';
 import { fetchQuota, formatQuota, tenantOf } from './quota.js';
 import { TraeProvider, startServer } from './openai-server.js';
-import { openStore, startOfToday, SQLITE_HELP } from './store.js';
+import { openStore, startOfToday, SQLITE_HELP, keyStem } from './store.js';
 import { createAdminHandler } from './admin.js';
 
 /** Where the gateway database lives unless `--db` says otherwise. */
@@ -351,7 +351,7 @@ async function cmdKeys() {
         console.error('用法: node src/cli.js keys add <label> [--note 备注] [--limit 200000]');
         process.exit(1);
       }
-      const plaintext = `sk-${String(label).toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${crypto.randomBytes(16).toString('hex')}`;
+      const plaintext = `sk-${keyStem(label)}-${crypto.randomBytes(16).toString('hex')}`;
       const limit = flags.limit === undefined ? null : Number(flags.limit);
       if (flags.limit !== undefined && !Number.isFinite(limit)) {
         console.error('--limit 必须是数字（tokens/天），或省略表示不限');
@@ -362,8 +362,31 @@ async function cmdKeys() {
       console.log('');
       console.log(`  ${plaintext}`);
       console.log('');
-      console.log('⚠️ 完整 key 只显示这一次：数据库只保存它的 SHA-256，无法再次读出。');
-      console.log('   立刻发给本人；需要更换请 keys add 一个新的，然后 keys rm 旧的。');
+      console.log('数据库保存了明文，随时可用 `keys show <label>` 或管理页 /admin 再看。');
+      console.log('需要作废请 keys rm 或 keys disable。');
+      return;
+    }
+
+    if (action === 'show') {
+      const needle = positional[1];
+      if (!needle) {
+        // No argument means "every key", which is what the admin page shows.
+        const all = store.listKeys();
+        if (!all.length) {
+          console.log('还没有 key。用 node src/cli.js keys add <label> 创建。');
+          return;
+        }
+        for (const key of all) {
+          console.log(`${key.label.padEnd(14)}${key.key ?? '(旧 key，无明文) ' + key.masked}`);
+        }
+        return;
+      }
+      const key = findKey(store, needle);
+      if (!key) {
+        console.error(`找不到 ${needle}`);
+        process.exit(1);
+      }
+      console.log(`${key.label}: ${key.key ?? '(旧 key，无明文，只能显示 ' + key.masked + ')'}`);
       return;
     }
 
@@ -668,6 +691,7 @@ if (!commands[command]) {
   console.log('  stop                   停止占用配置端口的网关进程');
   console.log('  keys add <label> [--limit N]   创建一把 key（只显示一次）');
   console.log('  keys list              查看 key 与今日用量');
+  console.log('  keys show [label]      查看完整 key（管理员）');
   console.log('  keys rm|enable|disable <label>');
   console.log('  keys limit <label> <N|none>');
   console.log('  report [--days 7]      按人汇总用量');

@@ -85,19 +85,62 @@ const realFetch = globalThis.fetch;
 console.log('smoke-gateway:');
 
 // ---------------------------------------------------------------- store
-await test('keys are stored as SHA-256, never plaintext', async () => {
+await test('a key authenticates by SHA-256 and is readable back by the operator', async () => {
   const store = openStore(':memory:');
   try {
-    store.addKey({ key: 'sk-alice-supersecret', label: 'alice' });
+    const created = store.addKey({ key: 'sk-alice-supersecret', label: 'alice' });
     const row = store.db.prepare('SELECT * FROM keys').get();
+    // Authentication reads the hash; the plaintext column exists only so an
+    // operator can re-read a key after the fact.
     assertEqual(row.id, hashKey('sk-alice-supersecret'), 'id is the hash');
-    assert(!JSON.stringify(row).includes('supersecret'), 'the plaintext appears nowhere in the row');
-    assertEqual(store.listKeys()[0].masked, 'sk-alice-…cret', 'display form is masked');
+    assertEqual(row.secret, 'sk-alice-supersecret', 'the plaintext is kept for the admin view');
+    assertEqual(created.key, 'sk-alice-supersecret', 'addKey hands the plaintext back');
+    assertEqual(store.listKeys()[0].key, 'sk-alice-supersecret', 'and listKeys exposes it');
+    assertEqual(store.listKeys()[0].masked, 'sk-alice-…cret', 'the masked form is still available');
     assertEqual(store.authenticate('sk-alice-supersecret').ok, true, 'the right key authenticates');
     assertEqual(store.authenticate('sk-alice-wrong').reason, 'unknown', 'a wrong key does not');
   } finally {
     store.close();
   }
+});
+
+await test('a database without the secret column is migrated, leaving old keys masked', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'trae-cn-migrate-'));
+  const file = path.join(dir, 'legacy.db');
+  try {
+    // Build the pre-migration shape by hand, then open it through GatewayStore.
+    const { DatabaseSync } = await import('node:sqlite');
+    const legacy = new DatabaseSync(file);
+    legacy.exec(`CREATE TABLE keys (
+      id TEXT PRIMARY KEY, label TEXT NOT NULL, note TEXT, prefix TEXT NOT NULL, last4 TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1, limit_tokens_per_day INTEGER, created_at INTEGER NOT NULL, last_seen INTEGER
+    )`);
+    legacy
+      .prepare('INSERT INTO keys (id, label, prefix, last4, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(hashKey('sk-old-key-abcd'), 'old', 'sk-old-key-', 'abcd', Math.floor(Date.now() / 1000));
+    legacy.close();
+
+    const store = openStore(file);
+    assertEqual(store.listKeys().length, 1, 'the legacy row survives');
+    assertEqual(store.listKeys()[0].key, null, 'a pre-migration key has no recoverable plaintext');
+    assertEqual(store.authenticate('sk-old-key-abcd').ok, true, 'and still authenticates');
+    // A new key written after migration does carry its plaintext.
+    store.addKey({ key: 'sk-new-key-efgh', label: 'new' });
+    const fresh = store.listKeys().find((k) => k.label === 'new');
+    assertEqual(fresh.key, 'sk-new-key-efgh', 'new rows get the secret column populated');
+    store.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('a label with no ASCII letters still yields an sk-<stem>- shape', async () => {
+  const { keyStem } = await load('src/store.js');
+  assertEqual(keyStem('alice'), 'alice', 'ascii passes through');
+  assertEqual(keyStem('Alice Smith'), 'alice-smith', 'spaces become dashes');
+  assertEqual(keyStem('烧麦'), 'key', 'a Chinese label falls back to `key`');
+  assertEqual(keyStem('测试新key'), 'key', 'and so does a mixed one with no ascii stem');
+  assertEqual(keyStem('---'), 'key', 'punctuation only falls back too');
 });
 
 await test('a disabled key is distinguishable from an unknown one', async () => {
@@ -456,7 +499,8 @@ await test('the admin page renders real numbers server-side', async () => {
     const html = await res.text();
     assert(html.includes('olga'), 'the key label is present');
     assert(html.includes('设计部'), 'the note is present');
-    assert(!html.includes('sk-olga-x'), 'the plaintext key is never rendered');
+    // The operator distributes these keys, so the page must show them in full.
+    assert(html.includes('sk-olga-x'), 'the plaintext key is rendered for the operator');
     assert(html.includes('123'), 'today\'s token count is in the first paint');
   } finally {
     await gateway.close();
@@ -493,7 +537,7 @@ await test('the admin page requires its own password, separate from the /v1 keys
   }
 });
 
-await test('creating a key through the admin API returns the plaintext exactly once', async () => {
+await test('creating a key through the admin API returns it, and it stays readable', async () => {
   const store = openStore(':memory:');
   const provider = await makeProvider();
   const gateway = await startGateway(provider, store);
@@ -509,13 +553,15 @@ await test('creating a key through the admin API returns the plaintext exactly o
     assertEqual(created.key.length > 30, true, 'and has real entropy');
     assertEqual(store.listKeys().length, 1, 'one key in the store');
 
-    // The value authenticates, while the store only holds its hash.
+    // The value authenticates by hash, and is stored so it can be shown again.
     assertEqual(store.authenticate(created.key).ok, true, 'the returned key works');
     const rawRow = store.db.prepare('SELECT * FROM keys').get();
-    assert(!JSON.stringify(rawRow).includes(created.key), 'the plaintext is not persisted');
+    assertEqual(rawRow.id, hashKey(created.key), 'lookup still goes through the hash');
+    assertEqual(rawRow.secret, created.key, 'the plaintext is persisted for the operator');
 
     const overview = await realFetch(`${gateway.base}/admin/api/overview`).then((r) => r.json());
-    assertEqual(overview.keys[0].masked, created.masked, 'the overview only exposes the masked form');
+    assertEqual(overview.keys[0].masked, created.masked, 'the overview carries the masked form');
+    assertEqual(overview.keys[0].key, created.key, 'and the full key alongside it');
     assertEqual(overview.keys[0].limitTokensPerDay, 500, 'with its cap');
   } finally {
     await gateway.close();

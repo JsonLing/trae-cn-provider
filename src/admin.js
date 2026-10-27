@@ -13,7 +13,7 @@
 // page is only bound to loopback (the CLI refuses a non-loopback bind without
 // it, see `serveCommand`).
 import crypto from 'node:crypto';
-import { STATUS, startOfToday } from './store.js';
+import { STATUS, startOfToday, keyStem } from './store.js';
 
 const REALM = 'trae-cn gateway admin';
 
@@ -184,7 +184,7 @@ export function createAdminHandler({ store, quota = () => null, password = null 
       if (!label) return sendError(res, 400, 'label 必填'), true;
       // The key is generated here, not accepted from the client: an operator
       // pasting a weak string would silently weaken every downstream call.
-      const plaintext = `sk-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${crypto.randomBytes(16).toString('hex')}`;
+      const plaintext = `sk-${keyStem(label)}-${crypto.randomBytes(16).toString('hex')}`;
       try {
         const created = store.addKey({
           key: plaintext,
@@ -262,8 +262,15 @@ function renderPage({ store, quota, password = null }) {
       const limit = key.limitTokensPerDay;
       const pct = limit ? Math.min(100, Math.round((spent / limit) * 100)) : 0;
       const state = !key.enabled ? 'off' : limit !== null && spent >= limit ? 'capped' : 'on';
+      // Older rows predate the `secret` column, so they can only be shown masked.
+      // Say so instead of rendering an empty cell that looks like a bug.
+      const keyCell = key.key
+        ? `<code class="key" title="${escapeHtml(key.key)}">${escapeHtml(key.key)}</code>
+           <button class="copy" data-copy="${escapeHtml(key.key)}">复制</button>`
+        : `<span class="sub">${escapeHtml(key.masked)}（旧 key，无明文）</span>`;
       return `<tr data-key="${escapeHtml(key.id)}">
-        <td><strong>${escapeHtml(key.label)}</strong><div class="sub">${escapeHtml(key.masked)}${key.note ? ` · ${escapeHtml(key.note)}` : ''}</div></td>
+        <td><strong>${escapeHtml(key.label)}</strong>${key.note ? `<div class="sub">${escapeHtml(key.note)}</div>` : ''}</td>
+        <td>${keyCell}</td>
         <td><span class="pill ${state}">${state === 'on' ? '启用' : state === 'off' ? '已停用' : '已触顶'}</span></td>
         <td class="num">${humanTokens(spent)}${limit !== null ? `<div class="sub">上限 ${humanTokens(limit)} · ${pct}%</div>` : '<div class="sub">不限额</div>'}</td>
         <td class="num">${Number(used.requests ?? 0)}</td>
@@ -321,6 +328,10 @@ function renderPage({ store, quota, password = null }) {
   #out { margin-top: 12px; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; display: none; }
   .warn { margin-top: 16px; padding: 10px 14px; border-radius: 8px; background: #fffbeb; border: 1px solid #fcd34d; color: #78350f; }
   .empty { padding: 18px; text-align: center; color: #94a3b8; background: #fff; border: 1px dashed #e2e8f0; border-radius: 10px; }
+  code.key { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; word-break: break-all; user-select: all; }
+  button.copy { margin-left: 6px; padding: 1px 7px; }
+  tr.flash { animation: flash 2.4s ease-out; }
+  @keyframes flash { 0%, 40% { background: #dbeafe; } 100% { background: transparent; } }
 </style>
 </head>
 <body>
@@ -345,13 +356,13 @@ ${passwordlessWarning(password)}
   <label>日上限 tokens（留空=不限）<input name="limit" type="number" min="0" placeholder="200000"></label>
   <button type="submit">生成</button>
 </form>
-<div class="muted" style="margin-top:6px">完整 key 只显示一次；数据库里只保存它的 SHA-256 哈希。</div>
+<div class="muted" style="margin-top:6px">创建后会立即出现在下表，可随时复制。鉴权走 SHA-256，明文只用于本页展示。</div>
 
 <h2>Key 与今日用量</h2>
 ${
   keys.length
     ? `<table>
-<thead><tr><th>label</th><th>状态</th><th class="num">今日 tokens</th><th class="num">请求</th><th class="num">异常</th><th>最近调用</th><th>操作</th></tr></thead>
+<thead><tr><th>label</th><th>key（管理员可见）</th><th>状态</th><th class="num">今日 tokens</th><th class="num">请求</th><th class="num">异常</th><th>最近调用</th><th>操作</th></tr></thead>
 <tbody>${keyRows}</tbody></table>`
     : '<div class="empty">还没有 key。先在上方创建一把，再发给同事。</div>'
 }
@@ -392,12 +403,61 @@ document.getElementById('create').addEventListener('submit', async (event) => {
       label: form.get('label'), note: form.get('note'),
       limitTokensPerDay: limit === '' ? null : Number(limit),
     });
-    show('新 key（只显示这一次，请立刻复制给使用者）：\\n\\n' + created.key);
+    // The new row has to be visible immediately: an operator who creates a key
+    // and then sees the old table assumes it failed. Reload, and carry the
+    // label in the hash purely so the row can be flashed after the reload.
+    // navigator.clipboard only exists in a secure context, and this page is
+    // served over plain HTTP on a LAN address, so treat copying as best effort.
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(created.key);
+      copied = true;
+    } catch {
+      /* not a secure context, or the document was not focused */
+    }
+    show('已创建 ' + created.label + '：' + created.key + '\\n' +
+      (copied ? '已复制到剪贴板。' : '浏览器不允许自动复制，请手动选中上面的 key。') +
+      '\\n页面即将刷新…');
     event.target.reset();
+    setTimeout(() => {
+      location.hash = 'created=' + encodeURIComponent(created.label);
+      location.reload();
+    }, 400);
   } catch (err) { show('创建失败：' + err.message); }
 });
 
+// After a create-triggered reload, scroll to and flash the new row.
+(function highlightCreated() {
+  const match = location.hash.match(/^#created=(.+)$/);
+  if (!match) return;
+  const label = decodeURIComponent(match[1]);
+  for (const row of document.querySelectorAll('tbody tr[data-key]')) {
+    if (row.querySelector('td strong')?.textContent === label) {
+      row.classList.add('flash');
+      row.scrollIntoView({ block: 'center' });
+      setTimeout(() => row.classList.remove('flash'), 2600);
+      break;
+    }
+  }
+  history.replaceState(null, '', location.pathname);
+})();
+
 document.addEventListener('click', async (event) => {
+  const copyButton = event.target.closest('button[data-copy]');
+  if (copyButton) {
+    const value = copyButton.dataset.copy;
+    try {
+      await navigator.clipboard.writeText(value);
+      copyButton.textContent = '已复制';
+      setTimeout(() => { copyButton.textContent = '复制'; }, 1500);
+    } catch {
+      // Clipboard needs a secure context; on plain http:// this is expected.
+      // Fall back to a prompt so the value is still selectable.
+      prompt('复制这把 key：', value);
+    }
+    return;
+  }
+
   const button = event.target.closest('button[data-act]');
   if (!button) return;
   const id = button.closest('tr').dataset.key;

@@ -8,11 +8,15 @@
 //
 // Design notes that are load-bearing:
 //
-//  * Keys are stored as SHA-256 hashes, never plaintext. An API key here is 128
-//    bits of randomness, so a salted KDF buys nothing: there is no dictionary
-//    to brute-force. The hash means a leaked `gateway.db` cannot be replayed
-//    against the gateway, and the admin page can only ever show a masked form
-//    (`sk-alice-8f3a…961f`). The full value is printed exactly once, at creation.
+//  * Keys keep BOTH a plaintext copy and its SHA-256. Authentication only ever
+//    reads the hash (`id`), so the lookup path is unchanged and a key can be
+//    revoked by deleting its row. The plaintext exists because an operator
+//    distributing keys to colleagues has to be able to read a key back after
+//    the fact — losing it means re-issuing and re-distributing, which is how
+//    people end up writing keys into chat logs. The trade is explicit: anyone
+//    who can read `gateway.db` can read every key. That file is 0600 and the
+//    admin page is behind its own password, so the exposure is the same as the
+//    operator's own credential file next to it.
 //  * `usage.key_label` is denormalised on purpose. Deleting a key must not
 //    erase who spent what, or the monthly report silently loses a row.
 //  * Every request writes a row, including aborts. A client that disconnects
@@ -55,6 +59,24 @@ export function hashKey(plaintext) {
  * @param {string} prefix - leading characters (usually the `sk-<name>-` stem).
  * @param {string} last4
  */
+/**
+ * Turn a human label into the ASCII stem of an API key.
+ *
+ * The stem is decoration — it exists so an operator can tell two keys apart in
+ * a list — so a label with no ASCII letters (e.g. a Chinese name) must not
+ * produce `sk--key-`. Falling back to `key` keeps every generated key in the
+ * `sk-<stem>-<32hex>` shape that clients and humans both expect.
+ * @param {string} label
+ */
+export function keyStem(label) {
+  const slug = String(label ?? '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug || 'key';
+}
+
 export function maskKey(prefix, last4) {
   return `${prefix || 'sk-'}…${last4 || '????'}`;
 }
@@ -77,6 +99,7 @@ CREATE TABLE IF NOT EXISTS keys (
   note                  TEXT,               -- free-form, e.g. team or purpose
   prefix                TEXT NOT NULL,      -- for the masked display only
   last4                 TEXT NOT NULL,
+  secret                TEXT,               -- the key itself, for the operator's admin view
   enabled               INTEGER NOT NULL DEFAULT 1,
   limit_tokens_per_day  INTEGER,            -- NULL = unlimited
   created_at            INTEGER NOT NULL,
@@ -134,7 +157,24 @@ export class GatewayStore {
     this.db.exec('PRAGMA busy_timeout = 5000');
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.exec(SCHEMA);
+    this.#migrate();
     this.#prepare();
+  }
+
+  /**
+   * Bring a database created by an earlier version up to the current schema.
+   *
+   * `CREATE TABLE IF NOT EXISTS` covers new files only. An existing gateway.db
+   * has a `keys` table without `secret`, and every statement here would fail
+   * with "no such column" until it is added. Keys issued before this version
+   * have no recoverable plaintext by design — the column stays NULL and the
+   * admin page shows them masked.
+   */
+  #migrate() {
+    const columns = this.db.prepare('PRAGMA table_info(keys)').all().map((row) => row.name);
+    if (!columns.includes('secret')) {
+      this.db.exec('ALTER TABLE keys ADD COLUMN secret TEXT');
+    }
   }
 
   #statements = null;
@@ -145,8 +185,8 @@ export class GatewayStore {
     this.#statements = {
       selectKey: db.prepare('SELECT * FROM keys WHERE id = ?'),
       insertKey: db.prepare(
-        `INSERT INTO keys (id, label, note, prefix, last4, enabled, limit_tokens_per_day, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO keys (id, label, note, prefix, last4, secret, enabled, limit_tokens_per_day, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       deleteKey: db.prepare('DELETE FROM keys WHERE id = ?'),
       listKeys: db.prepare('SELECT * FROM keys ORDER BY created_at DESC'),
@@ -201,11 +241,12 @@ export class GatewayStore {
       note === null || note === undefined || note === '' ? null : String(note),
       prefix,
       plaintext.slice(-4),
+      plaintext,
       enabled ? 1 : 0,
       limitTokensPerDay === null || limitTokensPerDay === undefined ? null : Math.max(0, Number(limitTokensPerDay)),
       nowSeconds(),
     );
-    return { id, label: name, masked: maskKey(prefix, plaintext.slice(-4)) };
+    return { id, label: name, masked: maskKey(prefix, plaintext.slice(-4)), key: plaintext };
   }
 
   /** @returns {object[]} every key, newest first. */
@@ -422,6 +463,9 @@ function publicKey(row) {  return {
     label: row.label,
     note: row.note ?? null,
     masked: maskKey(row.prefix, row.last4),
+    // The operator's own copy. Rows created before this column existed have
+    // `secret = NULL`; the UI falls back to the masked form for those.
+    key: row.secret ?? null,
     enabled: Boolean(row.enabled),
     limitTokensPerDay: row.limit_tokens_per_day === null ? null : Number(row.limit_tokens_per_day),
     createdAt: Number(row.created_at),
