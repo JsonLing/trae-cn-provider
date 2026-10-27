@@ -43,7 +43,9 @@
     "src/cli.js",
     "cordis.patch.yml",
     "README.md",
-    "SECURITY.md"
+    "SECURITY.md",
+    "src/store.js",
+    "src/admin.js"
   ],
   "bin": {
     "trae-cn": "src/cli.js"
@@ -55,7 +57,7 @@
     "chat": "node src/cli.js chat",
     "usage": "node src/cli.js usage",
     "check": "bash test/check.sh",
-    "test": "node test/smoke-adapter.js && node test/smoke-client.js && node test/smoke-plugin.js && node test/smoke-login.js && node test/smoke-quota.js",
+    "test": "node test/smoke-adapter.js && node test/smoke-client.js && node test/smoke-plugin.js && node test/smoke-login.js && node test/smoke-quota.js && node test/smoke-gateway.js",
     "prepublishOnly": "npm run check"
   },
   "dsh": {

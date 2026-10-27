@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { detectEnv, loadCredentials, saveCredentials } from './env.js';
 import { needsRefresh, refreshToken } from './trae-auth.js';
 import { chat, listModels, toTraeMessages } from './trae-client.js';
+import { STATUS } from './store.js';
 
 const CATALOG_TTL_MS = 60 * 60 * 1000;
 const CATALOG_RETRY_MS = 5 * 60 * 1000;
@@ -184,12 +185,35 @@ async function readBody(req, limit = 32 * 1024 * 1024) {
  * on the host's own web server instead of listening on a port: the plugin used
  * to hand the `http.Server` instance to `webServer.register()`, which is not
  * callable, so every request died as an opaque 400.
+ *
+ * Two authentication modes, chosen by whether a `store` is supplied:
+ *
+ *   * `store` set   - the gateway mode. A presented key is resolved against the
+ *                     `keys` table, its daily cap is enforced, and every chat
+ *                     request writes a `usage` row. This is what makes "who
+ *                     used how much" answerable.
+ *   * `store` unset - the original single-`apiKey` mode, kept for the loopback
+ *                     CLI and for the plugin's own mount, where there is no
+ *                     database and only one caller exists.
  */
-export function createRequestHandler(provider, { apiKey = null, allowOrigins = [] } = {}) {
+export function createRequestHandler(
+  provider,
+  { apiKey = null, allowOrigins = [], store = null, now = () => Date.now() } = {},
+) {
   const browserOrigins = new Set(
     (Array.isArray(allowOrigins) ? allowOrigins : []).map((value) => String(value ?? '').trim()).filter(Boolean),
   );
+
+  /** Pull the presented credential out of either accepted header. */
+  const presentedKey = (req) => {
+    const header = req.headers.authorization || '';
+    if (header.startsWith('Bearer ')) return header.slice(7).trim();
+    const alternate = req.headers['x-api-key'];
+    return typeof alternate === 'string' ? alternate.trim() : '';
+  };
+
   return async function handleRequest(req, res) {
+    const startedAt = now();
     const url = new URL(req.url, 'http://localhost');
     const path = url.pathname;
 
@@ -217,11 +241,65 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
     }
     if (path === '/health') return sendJson(res, 200, { ok: true, loggedIn: provider.ready, source: provider.env.source });
 
-    if (apiKey && path.startsWith('/v1/')) {
-      const header = req.headers.authorization || '';
-      const presented = header.startsWith('Bearer ') ? header.slice(7) : req.headers['x-api-key'];
-      if (presented !== apiKey) return sendError(res, 401, 'API Key 无效', 'authentication_error');
+    // ---- authentication -------------------------------------------------
+    //
+    // A refusal is itself recorded. Without that row, a leaked key being
+    // probed from somewhere else leaves no trace, and a colleague whose key was
+    // disabled only ever sees "401" with no matching entry in the report.
+    let caller = null;
+    if (path.startsWith('/v1/')) {
+      const presented = presentedKey(req);
+
+      if (store) {
+        const auth = store.authenticate(presented);
+        if (!auth.ok) {
+          const disabled = auth.reason === 'disabled';
+          store.record({
+            keyId: auth.key?.id ?? '',
+            keyLabel: auth.key?.label ?? 'unknown',
+            status: disabled ? STATUS.deniedDisabled : STATUS.deniedUnauthorized,
+            error: disabled ? 'key disabled' : 'unknown key',
+            ms: now() - startedAt,
+          });
+          return disabled
+            ? sendError(res, 403, `该 API Key 已被停用（${auth.key.label}），请联系管理员`, 'permission_error')
+            : sendError(res, 401, 'API Key 无效', 'authentication_error');
+        }
+        caller = auth.key;
+      } else if (apiKey && presented !== apiKey) {
+        return sendError(res, 401, 'API Key 无效', 'authentication_error');
+      }
     }
+
+    /**
+     * Build the one-shot recorder for this request. Exactly one row per chat
+     * attempt, whatever the outcome.
+     *
+     * The `once` flag matters: the streaming path can reach both its own
+     * `catch` and the outer `catch` when the upstream fails, and a double row
+     * would double-count a single request in the report.
+     */
+    let recorded = false;
+    const recordUsage = (patch) => {
+      if (!store || recorded) return;
+      recorded = true;
+      const usage = patch.usage ?? {};
+      const promptTokens = Number(usage.prompt_tokens ?? usage.inputTokens ?? usage.input_tokens ?? 0) || 0;
+      const completionTokens = Number(usage.completion_tokens ?? usage.outputTokens ?? usage.output_tokens ?? 0) || 0;
+      const totalTokens = Number(usage.total_tokens ?? usage.totalTokens ?? promptTokens + completionTokens) || 0;
+      store.record({
+        keyId: caller?.id ?? '',
+        keyLabel: caller?.label ?? 'unknown',
+        model: patch.model ?? null,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        status: patch.status ?? STATUS.ok,
+        error: patch.error ?? null,
+        ms: now() - startedAt,
+        sessionId: patch.sessionId ?? null,
+      });
+    };
 
     try {
       if (req.method === 'GET' && path === '/v1/models') {
@@ -242,14 +320,40 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
       }
 
       if (req.method === 'POST' && path === '/v1/chat/completions') {
-        if (!provider.ready) return sendError(res, 503, '尚未登录 Trae 账号', 'service_unavailable');
+        if (!provider.ready) {
+          recordUsage({ status: STATUS.upstreamError, error: 'provider not logged in' });
+          return sendError(res, 503, '尚未登录 Trae 账号', 'service_unavailable');
+        }
+
+        // The cap is checked before the body is parsed: an over-budget caller
+        // must not be able to make the gateway allocate 32 MB of buffers.
+        if (caller && store) {
+          const quota = store.checkQuota(caller);
+          if (!quota.allowed) {
+            recordUsage({ status: STATUS.deniedQuota, error: `daily cap ${quota.limit} reached` });
+            return sendError(
+              res,
+              429,
+              `今日额度已用尽（${quota.used}/${quota.limit} tokens），明日 00:00 重置`,
+              'rate_limit_error',
+            );
+          }
+        }
+
         const payload = await readBody(req);
         await provider.models();
         const caps = provider.resolveModel(payload.model);
-        if (!caps) return sendError(res, 404, `未知模型: ${payload.model}`);
+        if (!caps) {
+          recordUsage({ model: payload.model ?? null, status: STATUS.upstreamError, error: 'unknown model' });
+          return sendError(res, 404, `未知模型: ${payload.model}`);
+        }
         const wantStream = payload.stream !== false;
         const body = buildTraeBody(payload, caps, wantStream);
         const modelId = caps.configName;
+        // The upstream session id is generated inside `buildTraeBody`; echoing
+        // it into the usage row is what lets a request be matched against the
+        // enterprise console's per-session billing.
+        const sessionId = body.session_id ?? null;
 
         if (!wantStream) {
           let text = '';
@@ -267,6 +371,7 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
               },
             }),
           );
+          recordUsage({ model: modelId, status: STATUS.ok, usage: result.usage, sessionId });
           const message = { role: 'assistant', content: text || null };
           if (reasoning) message.reasoning_content = reasoning;
           if (toolCalls.length) {
@@ -294,7 +399,13 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
         res.write(sseChunk(modelId, { role: 'assistant', content: '' }));
 
         const abort = new AbortController();
-        req.on('close', () => abort.abort());
+        // `res.on('close')` — not `req` — is what distinguishes a client hang-up
+        // from a normal completion. An aborted call still burned upstream tokens
+        // before the disconnect, so it is recorded as its own status rather than
+        // silently vanishing from the report.
+        res.on('close', () => {
+          if (!res.writableEnded) abort.abort();
+        });
         try {
           const result = await provider.withAuthRetry((creds) =>
             chat({
@@ -303,6 +414,7 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
               body,
               signal: abort.signal,
               onEvent: (event) => {
+                if (res.writableEnded || res.destroyed) return;
                 if (event.type === 'text') res.write(sseChunk(modelId, { content: event.text }));
                 else if (event.type === 'reason') res.write(sseChunk(modelId, { reasoning_content: event.text }));
                 else if (event.type === 'tool') {
@@ -317,6 +429,7 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
               },
             }),
           );
+          recordUsage({ model: modelId, status: STATUS.ok, usage: result.usage, sessionId });
           const finish = result.finishReason === 'tool_calls' ? 'tool_calls' : result.finishReason || 'stop';
           if (result.usage) {
             res.write(`data: ${JSON.stringify({ id: 'chatcmpl-usage', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: modelId, choices: [], usage: result.usage })}\n\n`);
@@ -325,7 +438,14 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
           res.write('data: [DONE]\n\n');
           return res.end();
         } catch (err) {
-          if (!abort.signal.aborted) {
+          const aborted = abort.signal.aborted;
+          recordUsage({
+            model: modelId,
+            status: aborted ? STATUS.aborted : STATUS.upstreamError,
+            error: aborted ? 'client closed the connection' : err.message,
+            sessionId,
+          });
+          if (!aborted) {
             res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'upstream_error' } })}\n\n`);
           }
           return res.end();
@@ -334,6 +454,7 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
 
       return sendError(res, 404, `未知路径: ${path}`, 'not_found');
     } catch (err) {
+      recordUsage({ status: STATUS.upstreamError, error: err.message });
       provider.logger.error?.('[trae] 请求失败:', err.message);
       return sendError(res, 502, err.message, 'upstream_error');
     }
@@ -342,14 +463,39 @@ export function createRequestHandler(provider, { apiKey = null, allowOrigins = [
 
 /** A standalone server, used by the CLI (`serve`) and by tests. */
 export function createServer(provider, options = {}) {
-  return http.createServer(createRequestHandler(provider, options));
+  const handler = createRequestHandler(provider, options);
+  const admin = typeof options.adminHandler === 'function' ? options.adminHandler : null;
+  if (!admin) return http.createServer(handler);
+  // One port, two surfaces. The admin handler gets first refusal; when it
+  // returns false the OpenAI surface handles the request. Keeping them in one
+  // process is the whole point of the MVP: one command to start, one URL to
+  // remember, no reverse proxy to configure.
+  return http.createServer((req, res) => {
+    admin(req, res)
+      .then((owned) => {
+        if (!owned) handler(req, res);
+      })
+      .catch((err) => {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: { message: `admin handler failed: ${err.message}` } }));
+        } else {
+          res.end();
+        }
+      });
+  });
 }
 
-export function startServer(provider, { port = 8317, host = '127.0.0.1', apiKey = null, allowOrigins = [] } = {}) {
-  const server = createServer(provider, { apiKey, allowOrigins });
+export function startServer(
+  provider,
+  { port = 8317, host = '127.0.0.1', apiKey = null, allowOrigins = [], store = null, adminHandler = null } = {},
+) {
+  const server = createServer(provider, { apiKey, allowOrigins, store, adminHandler });
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(port, host, () => resolve({ server, url: `http://${host}:${port}` }));
+    // `port: 0` lets the OS pick, which the smoke tests rely on so two suites
+    // can run at once without racing for 8317.
+    server.listen(port, host, () => resolve({ server, url: `http://${host}:${server.address().port}` }));
   });
 }
 

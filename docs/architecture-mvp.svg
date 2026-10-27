@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1000" viewBox="0 0 1400 1000" font-family="PingFang SC, Hiragino Sans GB, Helvetica Neue, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowDash" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0ea5e9"/>
+    </marker>
+    <marker id="arrowUp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#e11d48"/>
+    </marker>
+  </defs>
+
+  <rect width="1400" height="1000" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="60" y="48" font-size="22" font-weight="700" fill="#0f172a">trae-cn-provider · MVP 中转站架构</text>
+  <text x="60" y="74" font-size="13" fill="#64748b">单账号 · 本地 SQLite · B 端管理页 · 一人一把 key（不复用）</text>
+
+  <!-- ============ clients ============ -->
+  <text x="60" y="120" font-size="12.5" font-weight="600" fill="#334155">局域网同事（每人一把 sk-key，不共用、不转发）</text>
+  <g>
+    <rect x="60" y="136" width="225" height="66" rx="9" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="76" y="162" font-size="13.5" font-weight="600" fill="#0f172a">curl / Postman</text>
+    <text x="76" y="184" font-size="11" fill="#64748b">最快验证，看 401/429</text>
+
+    <rect x="292" y="136" width="225" height="66" rx="9" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="308" y="162" font-size="13.5" font-weight="600" fill="#0f172a">OpenAI SDK</text>
+    <text x="308" y="184" font-size="11" fill="#64748b">base_url 指向内网 IP</text>
+
+    <rect x="524" y="136" width="225" height="66" rx="9" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="540" y="162" font-size="13.5" font-weight="600" fill="#0f172a">Cline / Claude Code</text>
+    <text x="540" y="184" font-size="11" fill="#64748b">自定义 provider</text>
+
+    <rect x="756" y="136" width="225" height="66" rx="9" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="772" y="162" font-size="13.5" font-weight="600" fill="#0f172a">Hermes</text>
+    <text x="772" y="184" font-size="11" fill="#64748b">api_mode: chat_completions</text>
+  </g>
+
+  <!-- client -> gateway arrow + label -->
+  <line x1="520" y1="202" x2="520" y2="252" stroke="#64748b" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="534" y="226" font-size="11.5" fill="#475569">HTTP · http://10.255.47.198:8317/v1 · Authorization: Bearer sk-…</text>
+  <text x="534" y="243" font-size="11" fill="#94a3b8">明文 HTTP、无 TLS —— 仅限可信内网</text>
+
+  <!-- ============ mac box ============ -->
+  <rect x="60" y="258" width="980" height="520" rx="14" fill="#fbfdff" stroke="#94a3b8" stroke-dasharray="7 5"/>
+  <text x="80" y="285" font-size="13" font-weight="700" fill="#0f172a">你的 Mac Mini · 单进程</text>
+  <text x="228" y="285" font-size="11.5" fill="#64748b" font-family="SFMono-Regular, Menlo, monospace">node src/cli.js serve --host 0.0.0.0 --port 8317 --db ~/.trae-proxy/gateway.db</text>
+
+  <!-- stage 1 -->
+  <rect x="80" y="300" width="940" height="64" rx="9" fill="#eef2ff" stroke="#818cf8"/>
+  <text x="98" y="325" font-size="13.5" font-weight="600" fill="#1e1b4b">① 鉴权：sk-key → caller</text>
+  <text x="98" y="347" font-size="11.5" fill="#4338ca">keys 表命中 + enabled=1 才放行；每 30s 热加载撤销；401 附 caller 落审计行</text>
+
+  <!-- stage 2 -->
+  <rect x="80" y="376" width="940" height="64" rx="9" fill="#eef2ff" stroke="#818cf8"/>
+  <text x="98" y="401" font-size="13.5" font-weight="600" fill="#1e1b4b">② 配额闸门（MVP：按 key 日 token 上限）</text>
+  <text x="98" y="423" font-size="11.5" fill="#4338ca">SUM(今日 usage) ≥ limit_tokens_per_day → 429；不设上限的 key 直接跳过</text>
+
+  <!-- stage 3 -->
+  <rect x="80" y="452" width="940" height="64" rx="9" fill="#ecfdf5" stroke="#34d399"/>
+  <text x="98" y="477" font-size="13.5" font-weight="600" fill="#064e3b">③ OpenAI 兼容面</text>
+  <text x="98" y="499" font-size="11.5" fill="#047857">GET /v1/models · POST /v1/chat/completions（stream / 非 stream）· Origin 头一律 403</text>
+
+  <!-- stage 4 -->
+  <rect x="80" y="528" width="940" height="64" rx="9" fill="#fff7ed" stroke="#fb923c"/>
+  <text x="98" y="553" font-size="13.5" font-weight="600" fill="#7c2d12">④ 记账中间件（唯一写库点）</text>
+  <text x="98" y="575" font-size="11.5" fill="#c2410c">成功 / 上游错误(4008,401) / 客户端中断(aborted) —— 三种结局都写一行，否则断流的用量查不到</text>
+
+  <!-- stage 5 -->
+  <rect x="80" y="604" width="940" height="64" rx="9" fill="#f5f3ff" stroke="#a78bfa"/>
+  <text x="98" y="629" font-size="13.5" font-weight="600" fill="#4c1d95">⑤ TraeProvider（单账号，保持不变）</text>
+  <text x="98" y="651" font-size="11.5" fill="#6d28d9">access token 过期前 30min 自动刷新 · apiHostFor() 选网关 · session_id 每请求</text>
+
+  <!-- internal arrow stage5 -> upstream (goes right) -->
+  <line x1="1020" y1="636" x2="1084" y2="636" stroke="#64748b" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="1022" y="626" font-size="10" fill="#475569">HTTPS</text>
+
+  <!-- stage-to-stage mini arrows -->
+  <line x1="550" y1="364" x2="550" y2="376" stroke="#cbd5e1" stroke-width="1.4"/>
+  <line x1="550" y1="440" x2="550" y2="452" stroke="#cbd5e1" stroke-width="1.4"/>
+  <line x1="550" y1="516" x2="550" y2="528" stroke="#cbd5e1" stroke-width="1.4"/>
+  <line x1="550" y1="592" x2="550" y2="604" stroke="#cbd5e1" stroke-width="1.4"/>
+
+  <!-- ============ upstream ============ -->
+  <rect x="1084" y="566" width="256" height="140" rx="11" fill="#fef2f2" stroke="#f87171"/>
+  <text x="1102" y="592" font-size="13" font-weight="700" fill="#7f1d1d">Trae 上游网关</text>
+  <text x="1102" y="614" font-size="10.5" fill="#991b1b" font-family="SFMono-Regular, Menlo, monospace">trae-api-cn.mchost.guru</text>
+  <text x="1102" y="631" font-size="10.5" fill="#991b1b" font-family="SFMono-Regular, Menlo, monospace">console.enterprise.trae.cn</text>
+  <text x="1102" y="656" font-size="10.5" fill="#b91c1c">/api/agent/v3/llm_utils_chat</text>
+  <text x="1102" y="673" font-size="10.5" fill="#b91c1c">SSE：token_usage / notify_usage</text>
+  <text x="1102" y="692" font-size="10" fill="#dc2626">额度不足 → 4008</text>
+
+  <!-- ============ admin ============ -->
+  <rect x="1084" y="300" width="256" height="230" rx="11" fill="#eff6ff" stroke="#60a5fa"/>
+  <text x="1102" y="327" font-size="13.5" font-weight="700" fill="#1e3a8a">B 端管理页</text>
+  <text x="1102" y="347" font-size="10.5" fill="#1d4ed8" font-family="SFMono-Regular, Menlo, monospace">GET /admin</text>
+  <text x="1102" y="364" font-size="10.5" fill="#1d4ed8" font-family="SFMono-Regular, Menlo, monospace">/admin/api/*</text>
+  <line x1="1102" y1="376" x2="1322" y2="376" stroke="#bfdbfe"/>
+  <text x="1102" y="396" font-size="11" fill="#1e40af">· key 列表：启停 / 新建 / 吊销</text>
+  <text x="1102" y="416" font-size="11" fill="#1e40af">· 用量排行（按人 / 按天 / 按模型）</text>
+  <text x="1102" y="436" font-size="11" fill="#1e40af">· 谁在 429 / 谁已停用</text>
+  <text x="1102" y="456" font-size="11" fill="#1e40af">· 账号余额（对账用）</text>
+  <text x="1102" y="476" font-size="11" fill="#1e40af">· 最近 N 条请求明细</text>
+  <text x="1102" y="500" font-size="10" fill="#3b82f6">服务端渲染 HTML + fetch，无构建步骤</text>
+  <text x="1102" y="518" font-size="10" fill="#3b82f6">仅监听 0.0.0.0 但需 admin 口令（Basic Auth）</text>
+
+  <!-- admin <-> mac dashed -->
+  <line x1="1084" y1="420" x2="1046" y2="420" stroke="#0ea5e9" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arrowDash)"/>
+  <text x="1052" y="411" font-size="10" fill="#0284c7">同一进程</text>
+
+  <!-- ============ db ============ -->
+  <text x="60" y="812" font-size="12.5" font-weight="600" fill="#334155">本地持久化（唯一事实来源）</text>
+
+  <rect x="60" y="824" width="640" height="120" rx="11" fill="#f0fdfa" stroke="#2dd4bf"/>
+  <text x="78" y="850" font-size="13" font-weight="700" fill="#134e4a">SQLite · ~/.trae-proxy/gateway.db</text>
+  <text x="330" y="850" font-size="10.5" fill="#0f766e">node:sqlite 内置，零依赖 / WAL / 单写者</text>
+
+  <rect x="78" y="864" width="196" height="62" rx="7" fill="#ffffff" stroke="#5eead4"/>
+  <text x="90" y="884" font-size="11.5" font-weight="600" fill="#115e59" font-family="SFMono-Regular, Menlo, monospace">keys</text>
+  <text x="90" y="901" font-size="9.8" fill="#0f766e">id, label, enabled,</text>
+  <text x="90" y="915" font-size="9.8" fill="#0f766e">limit_tokens_per_day, last_seen</text>
+
+  <rect x="286" y="864" width="196" height="62" rx="7" fill="#ffffff" stroke="#5eead4"/>
+  <text x="298" y="884" font-size="11.5" font-weight="600" fill="#115e59" font-family="SFMono-Regular, Menlo, monospace">usage</text>
+  <text x="298" y="901" font-size="9.8" fill="#0f766e">ts, key_id, model, tokens,</text>
+  <text x="298" y="915" font-size="9.8" fill="#0f766e">status, ms, session_id</text>
+
+  <rect x="494" y="864" width="188" height="62" rx="7" fill="#ffffff" stroke="#5eead4"/>
+  <text x="506" y="884" font-size="11.5" font-weight="600" fill="#115e59" font-family="SFMono-Regular, Menlo, monospace">quota_snapshots</text>
+  <text x="506" y="901" font-size="9.8" fill="#0f766e">ts, total, consumed,</text>
+  <text x="506" y="915" font-size="9.8" fill="#0f766e">remaining, billing_mode</text>
+
+  <!-- credentials -->
+  <rect x="720" y="824" width="320" height="120" rx="11" fill="#fefce8" stroke="#facc15"/>
+  <text x="738" y="850" font-size="13" font-weight="700" fill="#713f12">凭据（不属于 key 表）</text>
+  <text x="738" y="872" font-size="10.5" fill="#a16207" font-family="SFMono-Regular, Menlo, monospace">~/.trae-proxy/credentials.json</text>
+  <text x="738" y="892" font-size="10.5" fill="#a16207">0600 · 单账号 · 刷新后原地写回</text>
+  <text x="738" y="912" font-size="10.5" fill="#b45309">绝不发给别人；key 与凭据分离</text>
+
+  <!-- mac -> db arrows -->
+  <line x1="200" y1="778" x2="200" y2="824" stroke="#64748b" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="210" y="806" font-size="10.5" fill="#475569">每次请求写 usage，鉴权读 keys</text>
+
+  <line x1="880" y1="778" x2="880" y2="824" stroke="#64748b" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="890" y="806" font-size="10.5" fill="#475569">读 / 刷新</text>
+
+  <!-- budget line note -->
+  <text x="60" y="976" font-size="11" fill="#94a3b8">MVP 边界：单账号、明文 HTTP、无速率平滑、无计费定价 —— 只回答「谁用了多少、还能不能用」。</text>
+</svg>

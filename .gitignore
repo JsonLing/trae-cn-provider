@@ -13,6 +13,11 @@ node_modules/
 .DS_Store
 __pycache__/
 *.log
+.tmp/
+.gateway/
+*.db
+*.db-wal
+*.db-shm
 
 # Pending the `workflow` OAuth scope on the pushing account: the token used by
 # `gh` may not create or update workflow files, and a plain `git add -A` would

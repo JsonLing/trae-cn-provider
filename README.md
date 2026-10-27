@@ -30,7 +30,7 @@ macOS 优先、源码可审计、**凭据不出本机**。
 ## 它不做什么
 
 - 不代理、不中转、不上传任何凭据到第三方。**代码里出网的域名只有 Trae 官方域名**（见「出网清单」）。
-- 不共享额度给别人，不做多账号池，不做额度转卖。
+- 不做多账号池，不做额度转卖。网关模式（可选）只把**你自己的一个账号**分发给同事并记账，池化与转售仍不提供。
 - 不修改 Trae 客户端，不 hook 它的进程。
 
 ---
@@ -163,6 +163,101 @@ node src/cli.js chat "你好"
 > 任意一个页面都能对 `127.0.0.1` 上的这个端点发请求，用你的 Trae 登录态和额度跑模型。从 0.1.6 起，
 > 带 `Origin` 头的请求直接回 `403`，除非来源被加进 `allowBrowserOrigins`。服务端客户端（Hermes、
 > `openai-python`、`curl`）不发 `Origin`，行为不变。
+
+---
+
+## 网关模式：把模型分发给同事（单账号 + 按人记账）
+
+一个可选的能力：把上面的 OpenAI 兼容面开放到局域网，按人发 key，并记录每个人的用量。
+**仍然是同一个 Trae 账号**，不涉及多账号池，也不改变上游协议——只是在原有请求路径上插了鉴权和记账。
+
+加 `--db` 即开启：
+
+```bash
+node src/cli.js keys add alice --limit 200000   # 每人一把，上限 tokens/天
+node src/cli.js keys add bob                    # 不设上限
+node src/cli.js serve --host 0.0.0.0 --db --port 8317 --admin-password <口令>
+```
+
+启动后会打印所有可用的局域网地址：
+
+```
+  局域网入口（分布给同事）:
+              http://10.255.47.198:8317/v1   (en1)
+  鉴权:       按人发 key（已登记 2 把：alice, bob）
+  管理页:     http://127.0.0.1:8317/admin（需管理口令）
+```
+
+同事侧只需要三样：内网地址、**自己那把** `sk-...`、模型名（从 `/v1/models` 里选）。
+
+```bash
+curl -N http://10.255.47.198:8317/v1/chat/completions \
+  -H "Authorization: Bearer sk-alice-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Doubao-Seed-2.1-pro","stream":true,
+       "messages":[{"role":"user","content":"你好"}]}'
+```
+
+### key 怎么来
+
+**key 由你自己生成，与 Trae 无关。** Trae 侧那枚凭据（`~/.trae-proxy/credentials.json`）是给上游验身的，
+永远不该发给别人。发给同事的 `sk-<label>-<32 hex>` 由 `keys add` 或管理页生成，只与本地数据库核对。
+
+数据库里**只存 SHA-256**，明文只在创建的那一刻打印一次，之后无法再读出。所以：
+
+- 忘了就把旧 key `keys rm` 掉，重新 `keys add`；
+- 泄漏了同样处理，`keys disable <label>` 立即生效，不需要重启。
+
+### 三个命令够日常用
+
+```bash
+node src/cli.js keys list                 # key + 今日 tokens/上限 + 状态
+node src/cli.js keys disable alice        # 立即停用（401 → 403）
+node src/cli.js report --days 7           # 按人汇总
+node src/cli.js report --days 1
+```
+
+`report` 的输出按人分组，并单列「中断」与「上游错误」：
+
+```
+caller              请求      tokens      占比      中断      上游错误      被拒
+bob                  1         123     61%       0         0       0
+alice                2          78     39%       0         1       0
+unknown              2           0      0%       0         0       2
+合计                   5         201    100%       0         1       2
+```
+
+`unknown` 那一行是**鉴权失败**的请求（无效/无 key），它们不产生 token，但被记下来——
+否则一枚被翻找的 key 在你这里毫无痕迹。
+
+### 管理页
+
+`serve` 起好之后访问 `http://<host>:<port>/admin`（Basic Auth，口令即 `--admin-password`）。
+页面给出今日请求数、总 tokens、key 启停、每人用量排行、按模型分布、最近请求明细，并可以新建 key、
+改上限、停用、删除。渲染在服务端完成，**没有前端构建步骤**。
+
+管理页的鉴权是**独立**的：拿到 `/v1` key 的人打不开它。否则同事既能改自己的上限，也能看到所有人的用量。
+
+### 记账口径：三个必须知道的边界
+
+1. **每次请求都写一行**，包括客户端中途断开（`aborted`）和上游报错（`upstream_error`）。
+   只记成功的请求会让断流的人从报告里消失，而他往往是烧得最多的那个。
+2. **`notify_usage` 不是 token 用量。** 那是网关下发的余额快照，不能直接当扣费依据；
+   它被单独存到 `quota_snapshots`，只用来和账号余额做趋势对账。
+3. **企业席位的额度在控制台里按会话计量**，而 `trae-cn usage` 查的是个人积分账本，
+   所以它很可能长期显示 0 或一个不动的数字——**这不代表没人用**。看余额的「变化」而不是绝对值。
+
+### 安全边界（重要）
+
+- 网关监听 `0.0.0.0` 就等于**明文 HTTP 暴露在局域网**，没有 TLS。只应在可信内网使用。
+- 绑定非回环地址时，`serve` 会**拒绝启动**，除非你给了 `--db` 或 `--api-key`，
+  并且（网关模式下）给了 `--admin-password`。宁可不启动，也不做开放中继。
+- 带 `Origin` 头的浏览器请求依旧 `403`。如果同事用的是网页前端，让他走一层服务端代理。
+- 分发前记得关掉休眠，否则机器一睡服务就断：`sudo pmset -a sleep 0 disksleep 0 womp 1`。
+- 数据库在 `~/.trae-proxy/gateway.db`（`--db <path>` 可改）。里面是 key 的哈希和用量，**不含正文**——
+  对话内容不会落盘。
+
+`--db` 不传时 `serve` 与以前完全一致：可选单值 `--api-key`，没有数据库，没有管理页。
 
 ---
 
@@ -388,15 +483,17 @@ src/trae-client.js 上游客户端：目录 + SSE 解析 + 工具调用累积
 src/trae-auth.js   OAuth 登录、回调解析、令牌刷新（两种信封）
 src/trae-local-credentials.js 本机凭据读取（tc 解密 + 明文）
 src/openai-server.js OpenAI 兼容层
+src/store.js       网关数据库（SQLite）：keys / usage / quota_snapshots
+src/admin.js       B 端管理页与 /admin/api/*
 src/quota.js       只读额度快照（4008 排错用）
-src/cli.js         独立 CLI（login / models / serve / chat / usage）
+src/cli.js         独立 CLI（login / models / serve / chat / usage / keys / report）
 ```
 
 ## 开发
 
 ```bash
-npm run check     # 语法 + YAML + 清单一致性 + Config schema + 五套 smoke 测试（全部离线，mock fetch）
-npm test          # 只跑五套 smoke 测试
+npm run check     # 语法 + YAML + 清单一致性 + Config schema + 六套 smoke 测试（全部离线，mock fetch）
+npm test          # 只跑六套 smoke 测试
 ```
 
 smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**。五套分别覆盖：
@@ -406,6 +503,7 @@ smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**�
 - `smoke-plugin.js` — **插件入口 `apply()`**：Config 是否是可被 cordis 校验的 Standard Schema、provider/adapter 是否按契约注册、挂载的 OpenAI 接口是否真的能应答，以及 **`prepareCall().stream()` 同步返回 AsyncIterable**（防 `[Symbol.asyncIterator] is not a function` 回归）
 - `smoke-quota.js` — 额度快照与 4008：摘要解析、405/business-code 报错、`formatQuota` 的零余额提示，以及 `4008` 的错误消息里必须带上 `notify_usage` 的额度
 - `smoke-login.js` — **`/trae-login` 命令全链路**：命令注册 → `webLogin` → 授权链接 → **合成 Trae 的真实回调** → 凭据落盘。它把 `openInApp` 换成桩（否则会真的弹出浏览器），并用 `TRAE_PROXY_CRED_DIR` 隔离凭据文件，**不会碰你真实的登录态**
+- `smoke-gateway.js` — **网关模式**：key 只以 SHA-256 落盘、停用与未知 key 可区分、日上限的边界（100/100 即触顶、被拒的请求不占额度、中断的请求占额度）、删 key 后历史用量仍在、**流式多 chunk 只写一行**、4008 记为 `upstream_error`、超限在**读请求体之前**就 429、中途断开记为 `aborted`、管理页鉴权与 `/v1` key 完全分离、跨站 POST 被拒，以及无 store 时仍退回单 key 模式。它用真实 `node:sqlite`（内存或临时文件）跑出真实 SQL，只 mock 上游 fetch
 
 另有两个**需要联网的手动脚本**（不在 `npm run check` 里）：
 
@@ -516,7 +614,7 @@ dsh plugin --profile desktop add trae-cn-provider   # 需先完全退出桌面�
 
 **2. `prepublishOnly` 会先跑完 `npm run check`。**
 
-所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、五套 smoke）。
+所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、六套 smoke）。
 
 ### 上架 dsh.so（社区插件市场）
 
@@ -718,6 +816,7 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
+| **未发布** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 只存 SHA-256 / usage / quota_snapshots）、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（23 条断言，真实 `node:sqlite`） |
 | **0.1.7** | **企业账号 4008 修复**：企业流量必须打租户网关（凭据里的 `saasBootConfig.apiHost`，如 `console.enterprise.trae.cn`），且请求体必须带 `session_id`，否则消费版网关会按个人积分结算并回 `4008`——即使企业席位额度还有 ¥300。现在 `apiHostFor()` 自动选网关、`session_id`/`conversation_id` 固定随请求发送，企业控制台也能按会话看到用量。另加额度可观测：① 只读 `trae-cn usage`（`npm run usage`）查询 `web_user_ent_usage`，不消耗积分；② `notify_usage` 不再被当成 token usage；③ `4008` 带 `ide_credits`/`work_credits`/`billing_mode` 并被 DSH 归类为 `QUOTA`。文档新增「额度与用量（4008 排错）」 |
 | **0.1.6** | 安全加固，来自 dsh.so 动态审计的两条发现：① `/v1` 默认不再下发 `Access-Control-Allow-Origin: *`，带 `Origin` 头的请求一律 `403`（新增 `allowBrowserOrigins` 白名单）—— 以前任意网页都能用你的 Trae 额度；② `login-debug.log` 落盘前对回调参数脱敏，`userJwt` / `refreshToken` / `userInfo` 等敏感值替换成 `<redacted N>` —— 以前令牌会被复制到凭据文件之外。两条都有回归测试锁住 |
 | 0.1.5 | 文档为主：新增「让别的 agent 框架也用上（以 Hermes 为例）」的完整接法与排错 —— DSH 宿主端口每次启动都会变、桌面端输入框的模型选择是粘性的、`fallback_providers` 必须是 YAML 列表（写成 JSON 字符串会被静默忽略）；补 LaunchAgent 常驻写法。运行时行为与 0.1.4 一致 |

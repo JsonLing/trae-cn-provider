@@ -1,12 +1,20 @@
 #!/usr/bin/env node
-// cli.js - login / models / serve / chat
+// cli.js - login / models / serve / chat / usage / keys / report
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
-import { detectEnv, loadCredentials, saveCredentials, CRED_FILE } from './env.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { detectEnv, loadCredentials, saveCredentials, CRED_DIR, CRED_FILE } from './env.js';
 import { webLogin } from './trae-auth.js';
 import { chat } from './trae-client.js';
 import { fetchQuota, formatQuota, tenantOf } from './quota.js';
 import { TraeProvider, startServer } from './openai-server.js';
+import { openStore, startOfToday, SQLITE_HELP } from './store.js';
+import { createAdminHandler } from './admin.js';
+
+/** Where the gateway database lives unless `--db` says otherwise. */
+export const DEFAULT_DB = path.join(CRED_DIR, 'gateway.db');
 
 function requireCredentials() {
   const creds = loadCredentials();
@@ -17,9 +25,53 @@ function requireCredentials() {
   return creds;
 }
 
+/**
+ * Parse `--flag value` and `--flag=value` after the command name.
+ * Unknown positional arguments are returned as `_`.
+ */
+function parseArgs(argv) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token.startsWith('--')) {
+      const eq = token.indexOf('=');
+      if (eq > 0) {
+        flags[token.slice(2, eq)] = token.slice(eq + 1);
+      } else {
+        const next = argv[i + 1];
+        if (next === undefined || next.startsWith('--')) flags[token.slice(2)] = true;
+        else {
+          flags[token.slice(2)] = next;
+          i += 1;
+        }
+      }
+    } else {
+      positional.push(token);
+    }
+  }
+  return { flags, positional };
+}
+
+/** Every non-internal IPv4 address this machine answers on. */
+function lanAddresses() {
+  const out = [];
+  for (const [name, entries] of Object.entries(os.networkInterfaces())) {
+    for (const entry of entries ?? []) {
+      if (entry.family !== 'IPv4' || entry.internal) continue;
+      // 169.254/16 is the self-assigned address a machine gives itself when
+      // DHCP failed; it is reachable by nobody else, so listing it as a LAN
+      // address would be actively misleading.
+      if (entry.address.startsWith('169.254.')) continue;
+      out.push({ name, address: entry.address });
+    }
+  }
+  return out;
+}
+
 async function cmdLogin() {
   const env = detectEnv();
-  console.log(`Trae CN 环境: ideVersion=${env.ideVersion} versionCode=${env.ideVersionCode} (${env.source})`);
+  console.log(`Trae CN 环境: ideVersion=${env.ideVersion} versionCode=${env.appVersionCode} (${env.source})`);
   console.log('即将在浏览器中打开 Trae 授权页，请在页面上登录你自己的账号。\n');
   const creds = await webLogin({
     ideVersion: env.ideVersion,
@@ -57,27 +109,119 @@ async function cmdModels() {
 }
 
 async function cmdServe() {
-  const args = process.argv.slice(3);
-  const portArg = args.indexOf('--port');
-  const port = Number(portArg >= 0 ? args[portArg + 1] : process.env.PORT || 8317);
-  const keyArg = args.indexOf('--api-key');
-  const apiKey = keyArg >= 0 ? args[keyArg + 1] : process.env.API_KEY || null;
+  const { flags } = parseArgs(process.argv.slice(3));
+  const port = Number(flags.port ?? process.env.PORT ?? 8317);
+  const host = String(flags.host ?? process.env.HOST ?? '127.0.0.1');
+  const apiKey = flags['api-key'] ?? process.env.API_KEY ?? null;
+  const adminPassword = flags['admin-password'] ?? process.env.ADMIN_PASSWORD ?? null;
+
+  // Gateway mode is opt-in: `--db` (with or without a path) turns on the key
+  // table, the daily caps and the usage ledger. Without it `serve` behaves
+  // exactly as before — one optional `--api-key`, no database — so an existing
+  // single-user setup keeps working after an upgrade.
+  const gateway = Boolean(flags.db || flags.gateway);
+  let store = null;
+  if (gateway) {
+    const file = typeof flags.db === 'string' ? path.resolve(flags.db) : DEFAULT_DB;
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    try {
+      store = openStore(file);
+    } catch (err) {
+      console.error(`无法打开数据库 ${file}: ${err.message}`);
+      if (err.message === SQLITE_HELP) console.error(SQLITE_HELP);
+      process.exit(1);
+    }
+  }
+
+  // A non-loopback bind with no credential is an open relay spending your own
+  // quota. Refuse rather than warn: a warning on stderr is exactly the message
+  // that scrolls past in a terminal someone is not watching.
+  const loopback = host === '127.0.0.1' || host === '::1' || host === 'localhost';
+  if (!loopback && !store && !apiKey) {
+    console.error(
+      `拒绝启动：--host ${host} 会把端点暴露到局域网，但没有 --api-key 也没有 --db。\n` +
+        '  请二选一：加 --db（推荐，按人发 key 并记账）或加 --api-key（单一共享口令）。',
+    );
+    process.exit(1);
+  }
+  if (!loopback && store && !adminPassword) {
+    console.error(
+      '拒绝启动：网关模式下绑定非回环地址时必须设置 --admin-password。\n' +
+        '  否则任何拿到 key 的人都能打开 /admin 改自己的额度、看所有人的用量。',
+    );
+    store.close();
+    process.exit(1);
+  }
+
   const provider = new TraeProvider({ credentials: requireCredentials() });
-  const { url } = await startServer(provider, { port, apiKey });
-  console.log(`Trae CN → OpenAI 兼容服务已启动: ${url}`);
-  console.log(`  Base URL: ${url}/v1`);
-  console.log(`  API Key : ${apiKey || '(未设置，仅监听 127.0.0.1)'}`);
-  console.log(`  模型目录: http://127.0.0.1:${port}/v1/models`);
+  // The admin header wants the account balance, which is a networked call. It
+  // is cached for five minutes and refreshed in the background: an operator
+  // opening the page must never wait on the dashboard endpoint, and a balance a
+  // few minutes stale is still the right number to reconcile against.
+  let quotaCache = { at: 0, value: null, inFlight: false };
+  const quotaReader = () => {
+    if (!quotaCache.inFlight && Date.now() - quotaCache.at > 5 * 60 * 1000) {
+      quotaCache = { ...quotaCache, inFlight: true };
+      fetchQuota(loadCredentials() ?? {})
+        .then((snapshot) => {
+          quotaCache = { at: Date.now(), value: snapshot, inFlight: false };
+          store?.recordQuota({ ...snapshot, source: 'web_user_ent_usage' });
+        })
+        .catch(() => {
+          quotaCache = { ...quotaCache, at: Date.now(), inFlight: false };
+        });
+    }
+    return quotaCache.value;
+  };
+
+  const adminHandler = store
+    ? createAdminHandler({ store, password: adminPassword, quota: quotaReader })
+    : null;
+
+  const { server, url } = await startServer(provider, { port, host, apiKey, store, adminHandler });
+  const actualPort = server.address()?.port ?? port;
+  const shownHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+
+  console.log(`Trae CN → OpenAI 兼容服务已启动`);
+  console.log(`  本机入口:   http://${shownHost}:${actualPort}/v1`);
+  if (!loopback) {
+    const addresses = lanAddresses();
+    if (addresses.length) {
+      console.log('  局域网入口（分发给同事）:');
+      for (const entry of addresses) console.log(`              http://${entry.address}:${actualPort}/v1   (${entry.name})`);
+      console.log('              静态 IP 更稳：DHCP 续约后地址可能变，记得在路由器里做绑定。');
+    } else {
+      console.log('  局域网入口: (未检测到非回环 IPv4 地址)');
+    }
+  }
+  if (store) {
+    const keys = store.listKeys();
+    console.log(`  鉴权:       按人发 key（已登记 ${keys.length} 把：${keys.map((k) => k.label).join(', ') || '尚未创建'}）`);
+    console.log(`  数据库:     ${store.file}`);
+    console.log(`  管理页:     http://${shownHost}:${actualPort}/admin${adminPassword ? '（需管理口令）' : '（仅本机可访问）'}`);
+    if (!keys.length) console.log('  下一步:     node src/cli.js keys add alice');
+  } else {
+    console.log(`  API Key : ${apiKey || '(未设置，仅监听 127.0.0.1)'}`);
+  }
+  console.log(`  模型目录: http://${shownHost}:${actualPort}/v1/models`);
   try {
     const models = await provider.models();
     console.log(`  已加载 ${models.length} 个模型`);
   } catch (err) {
     console.error(`  模型目录预拉取失败: ${err.message}`);
   }
-  process.on('SIGINT', () => {
+
+  const shutdown = () => {
     console.log('\n已停止');
-    process.exit(0);
-  });
+    try {
+      server.close();
+      store?.close();
+    } finally {
+      process.exit(0);
+    }
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 async function cmdChat() {
@@ -123,11 +267,263 @@ async function cmdUsage() {
   console.log(formatQuota(snapshot, { ...tenantOf(creds.token), username: creds.username || '' }));
 }
 
-const commands = { login: cmdLogin, models: cmdModels, serve: cmdServe, chat: cmdChat, usage: cmdUsage };
+/** `keys add|list|rm|enable|disable|limit` — the operator's key management. */
+async function cmdKeys() {
+  const { flags, positional } = parseArgs(process.argv.slice(3));
+  const action = positional[0] || 'list';
+  const file = typeof flags.db === 'string' ? path.resolve(flags.db) : DEFAULT_DB;
+  let store;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    store = openStore(file);
+  } catch (err) {
+    console.error(`无法打开数据库 ${file}: ${err.message}`);
+    process.exit(1);
+  }
+
+  try {
+    if (action === 'add') {
+      const label = positional[1] || flags.label;
+      if (!label) {
+        console.error('用法: node src/cli.js keys add <label> [--note 备注] [--limit 200000]');
+        process.exit(1);
+      }
+      const plaintext = `sk-${String(label).toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${crypto.randomBytes(16).toString('hex')}`;
+      const limit = flags.limit === undefined ? null : Number(flags.limit);
+      if (flags.limit !== undefined && !Number.isFinite(limit)) {
+        console.error('--limit 必须是数字（tokens/天），或省略表示不限');
+        process.exit(1);
+      }
+      const created = store.addKey({ key: plaintext, label, note: flags.note ?? null, limitTokensPerDay: limit });
+      console.log(`已创建 ${created.label}（${created.masked}）`);
+      console.log('');
+      console.log(`  ${plaintext}`);
+      console.log('');
+      console.log('⚠️ 完整 key 只显示这一次：数据库只保存它的 SHA-256，无法再次读出。');
+      console.log('   立刻发给本人；需要更换请 keys add 一个新的，然后 keys rm 旧的。');
+      return;
+    }
+
+    if (action === 'list' || action === undefined) {
+      const keys = store.listKeys();
+      if (!keys.length) {
+        console.log('还没有 key。用 node src/cli.js keys add <label> 创建。');
+        return;
+      }
+      const rows = keys.map((key) => {
+        const used = store.tokensToday(key.id);
+        const state = !key.enabled ? '已停用' : key.limitTokensPerDay !== null && used.tokens >= key.limitTokensPerDay ? '已触顶' : '启用';
+        const limit = key.limitTokensPerDay === null ? '不限' : String(key.limitTokensPerDay);
+        return { label: key.label, masked: key.masked, state, today: `${used.tokens}/${limit}`, note: key.note ?? '', id: key.id };
+      });
+      const widths = { label: 10, masked: 24, state: 6, today: 18 };
+      console.log(
+        'label'.padEnd(widths.label) +
+          'key'.padEnd(widths.masked) +
+          '状态'.padEnd(widths.state) +
+          '今日 tokens/上限'.padEnd(widths.today) +
+          '备注',
+      );
+      for (const row of rows) {
+        console.log(
+          row.label.padEnd(widths.label) +
+            row.masked.padEnd(widths.masked) +
+            row.state.padEnd(widths.state) +
+            row.today.padEnd(widths.today) +
+            row.note,
+        );
+      }
+      console.log('');
+      console.log(`数据库: ${file}`);
+      return;
+    }
+
+    if (action === 'rm' || action === 'remove' || action === 'delete') {
+      const label = positional[1];
+      if (!label) {
+        console.error('用法: node src/cli.js keys rm <label|key-id>');
+        process.exit(1);
+      }
+      const key = findKey(store, label);
+      if (!key) {
+        console.error(`找不到 ${label}`);
+        process.exit(1);
+      }
+      store.removeKey(key.id);
+      console.log(`已删除 ${key.label}（${key.masked}）。历史用量仍保留在报告里。`);
+      return;
+    }
+
+    if (action === 'enable' || action === 'disable') {
+      const label = positional[1];
+      if (!label) {
+        console.error(`用法: node src/cli.js keys ${action} <label>`);
+        process.exit(1);
+      }
+      const key = findKey(store, label);
+      if (!key) {
+        console.error(`找不到 ${label}`);
+        process.exit(1);
+      }
+      store.setEnabled(key.id, action === 'enable');
+      console.log(`${key.label}: ${action === 'enable' ? '已启用' : '已停用（立即生效，无需重启）'}`);
+      return;
+    }
+
+    if (action === 'limit') {
+      const label = positional[1];
+      const raw = positional[2];
+      if (!label || raw === undefined) {
+        console.error('用法: node src/cli.js keys limit <label> <tokens/天|none>');
+        process.exit(1);
+      }
+      const key = findKey(store, label);
+      if (!key) {
+        console.error(`找不到 ${label}`);
+        process.exit(1);
+      }
+      const value = raw === 'none' || raw === '0' ? null : Number(raw);
+      if (value !== null && !Number.isFinite(value)) {
+        console.error('上限必须是数字，或 none 表示不限');
+        process.exit(1);
+      }
+      store.setLimit(key.id, value);
+      console.log(`${key.label}: 日上限 ${value === null ? '不限额' : value}`);
+      return;
+    }
+
+    console.error(`未知子命令: ${action}（可用: add / list / rm / enable / disable / limit）`);
+    process.exit(1);
+  } finally {
+    store.close();
+  }
+}
+
+/** Resolve a key by label or by a prefix of its id/hash. */
+function findKey(store, needle) {
+  const key = store.listKeys().find((row) => row.label === needle || row.masked === needle || row.id === needle);
+  if (key) return key;
+  if (/^[0-9a-f]{6,}$/i.test(needle)) return store.listKeys().find((row) => row.id.startsWith(needle.toLowerCase())) ?? null;
+  return null;
+}
+
+/** `report` (alias `usage-report`) — per-person totals over a window. */
+async function cmdReport() {
+  const { flags } = parseArgs(process.argv.slice(3));
+  const days = Math.max(1, Math.min(90, Number(flags.days ?? 1) || 1));
+  const file = typeof flags.db === 'string' ? path.resolve(flags.db) : DEFAULT_DB;
+  let store;
+  try {
+    store = openStore(file);
+  } catch (err) {
+    console.error(`无法打开数据库 ${file}: ${err.message}`);
+    process.exit(1);
+  }
+
+  try {
+    // Local midnight, N-1 days back: `--days 7` means "today plus the six
+    // preceding calendar days", which is what an operator expects.
+    const until = startOfToday() + 86400;
+    const since = startOfToday() - (days - 1) * 86400;
+    const rows = store.report({ since, until });
+    const label = days === 1 ? '今日' : `近 ${days} 天`;
+    console.log(`${label}用量（${store.file}）\n`);
+
+    if (!rows.length) {
+      console.log('  没有记录。可能是：还没开始用、数据库路径不对，或所有请求都被拦在最前面。');
+      return;
+    }
+
+    const grand = rows.reduce(
+      (acc, row) => ({
+        requests: acc.requests + row.requests,
+        tokens: acc.tokens + row.totalTokens,
+        aborted: acc.aborted + row.abortedRequests,
+        errors: acc.errors + row.upstreamErrors,
+        denied: acc.denied + row.quotaDenied + row.unauthorized + row.disabledDenied,
+      }),
+      { requests: 0, tokens: 0, aborted: 0, errors: 0, denied: 0 },
+    );
+
+    const pad = (value, width) => String(value).padEnd(width);
+    const padLeft = (value, width) => String(value).padStart(width);
+    console.log(`${pad('caller', 14)}${padLeft('请求', 8)}${padLeft('tokens', 12)}${padLeft('占比', 8)}${padLeft('中断', 8)}${padLeft('上游错误', 10)}${padLeft('被拒', 8)}`);
+    for (const row of rows) {
+      const share = grand.tokens > 0 ? `${Math.round((row.totalTokens / grand.tokens) * 100)}%` : '—';
+      console.log(
+        pad(row.label, 14) +
+          padLeft(row.requests, 8) +
+          padLeft(row.totalTokens, 12) +
+          padLeft(share, 8) +
+          padLeft(row.abortedRequests, 8) +
+          padLeft(row.upstreamErrors, 10) +
+          padLeft(row.quotaDenied + row.unauthorized + row.disabledDenied, 8),
+      );
+    }
+    console.log(
+      pad('合计', 14) +
+        padLeft(grand.requests, 8) +
+        padLeft(grand.tokens, 12) +
+        padLeft('100%', 8) +
+        padLeft(grand.aborted, 8) +
+        padLeft(grand.errors, 10) +
+        padLeft(grand.denied, 8),
+    );
+
+    const byModel = store.byModel({ since, until });
+    if (byModel.length) {
+      console.log('\n按模型:');
+      for (const row of byModel.slice(0, 8)) {
+        console.log(`  ${pad(row.model, 30)}${padLeft(row.requests, 6)} 次${padLeft(row.totalTokens, 12)} tokens`);
+      }
+    }
+
+    const latest = store.latestQuota();
+    if (latest) {
+      console.log(
+        `\n上游余额快照（${new Date(latest.ts * 1000).toLocaleString()}）：` +
+          `已用 ${latest.consumed} / 总量 ${latest.total}，剩余 ${latest.remaining}` +
+          `${latest.billing_mode ? `（${latest.billing_mode}）` : ''}`,
+      );
+      console.log('  这是账号级读数，不是本次窗口的增量：只用来判断本地记账有没有漏记。');
+    }
+
+    if (grand.aborted > 0) {
+      console.log(`\n提示: 有 ${grand.aborted} 次请求在完成前被客户端断开。这些已计入 tokens（若上游已回传），`);
+      console.log('      说明有调用方在中途取消 —— 常见于 IDE 里点了停止，或客户端超时。');
+    }
+    if (grand.denied > 0) {
+      console.log(`\n提示: 有 ${grand.denied} 次请求被拒（401/403/429）。429 表示某人当日额度已触顶。`);
+    }
+  } finally {
+    store.close();
+  }
+}
+
+const commands = {
+  login: cmdLogin,
+  models: cmdModels,
+  serve: cmdServe,
+  chat: cmdChat,
+  usage: cmdUsage,
+  keys: cmdKeys,
+  report: cmdReport,
+  'usage-report': cmdReport,
+};
 
 const command = process.argv[2];
 if (!commands[command]) {
-  console.log('用法: node src/cli.js <login|models|serve|chat|usage>');
+  console.log('用法: node src/cli.js <login|models|serve|chat|usage|keys|report>');
+  console.log('');
+  console.log('  login                  浏览器登录 Trae 账号');
+  console.log('  models                 列出可用模型');
+  console.log('  serve [--host 0.0.0.0] [--db] [--admin-password <pw>]');
+  console.log('                         启动 OpenAI 兼容服务；--db 开启多 key + 记账');
+  console.log('  keys add <label> [--limit N]   创建一把 key（只显示一次）');
+  console.log('  keys list              查看 key 与今日用量');
+  console.log('  keys rm|enable|disable <label>');
+  console.log('  keys limit <label> <N|none>');
+  console.log('  report [--days 7]      按人汇总用量');
   process.exit(command ? 1 : 0);
 }
 commands[command]().catch((err) => {
