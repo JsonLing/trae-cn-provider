@@ -68,6 +68,40 @@ So the surface is locked down in two ways:
 Both are opt-in hardening on top of the loopback binding; neither claims to
 sandbox the endpoint from other local processes, which can always connect.
 
+## Gateway mode: API keys at rest and the admin page
+
+`serve --db` turns on a local SQLite gateway (`~/.trae-proxy/gateway.db`). It adds
+two new surfaces, and both are opt-in — nothing here runs unless `--db` is passed.
+
+**API keys are stored in plaintext alongside their SHA-256.** Authentication only
+ever reads the hash, so a key can be revoked by deleting its row. The plaintext
+column exists because an operator distributing keys has to be able to read one
+back later; losing it means re-issuing and re-distributing, which is how people
+end up pasting keys into chat logs. The trade is explicit and bounded by file
+permissions: `gateway.db` is created `0600` inside a `0700` directory, next to
+the credential file it already sits beside. **Anyone who can read that file can
+read every issued key** — the same exposure as the operator's own credentials.
+
+The database never stores prompt or completion text. A `usage` row carries the
+timestamp, key label, model name, token counts, status, duration and the upstream
+session id, which is what makes per-person accounting possible. Conversation
+content is not among them.
+
+**The `/admin` page has its own password, separate from every `/v1` key.** An API
+key holder must not be able to reach it: they could raise their own daily cap,
+read everybody else's usage, or mint themselves a new key. `serve` refuses to
+start on a non-loopback bind without `--admin-password`, and also refuses a
+non-loopback bind with neither `--db` nor `--api-key` — an unauthenticated
+gateway on a LAN would spend the operator's own quota.
+
+**The gateway speaks plain HTTP and has no TLS.** It is built for a trusted
+network. Exposing it to the internet requires a TLS-terminating proxy in front;
+the project does not ship one. `--host 0.0.0.0` is a deliberate act, which is why
+the startup banner prints every address it just became reachable on.
+
+Browser `Origin` requests are still refused (`403`) unless listed in
+`allowBrowserOrigins`, on the gateway surface as well.
+
 ## Nothing secret is written to the debug log
 
 `~/.trae-proxy/login-debug.log` exists to diagnose unrecognised OAuth callbacks.

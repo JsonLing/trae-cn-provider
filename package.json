@@ -1,6 +1,6 @@
 {
   "name": "trae-cn-provider",
-  "version": "0.1.8",
+  "version": "0.2.1",
   "private": false,
   "type": "module",
   "description": "Trae CN as a native DeepSeek Harness LLM provider: browser OAuth login by default, optional local-install credential source, OpenAI-compatible surface on the host web server",
@@ -43,7 +43,9 @@
     "src/cli.js",
     "cordis.patch.yml",
     "README.md",
-    "SECURITY.md"
+    "SECURITY.md",
+    "src/store.js",
+    "src/admin.js"
   ],
   "bin": {
     "trae-cn": "src/cli.js"
@@ -54,8 +56,17 @@
     "serve": "node src/cli.js serve",
     "chat": "node src/cli.js chat",
     "usage": "node src/cli.js usage",
+    "gateway:init": "node src/cli.js init",
+    "gateway": "node src/cli.js serve --config \"$HOME/.trae-proxy/gateway.json\"",
+    "gateway:deepseek": "node src/cli.js serve --host 0.0.0.0 --port 8317 --db \"$PWD/.gateway/gateway.db\" --default-model DeepSeek-V4.1-Flash-1017 --admin-password \"${ADMIN_PASSWORD:?先 export ADMIN_PASSWORD}\"",
+    "gateway:local": "node src/cli.js serve --host 0.0.0.0 --port 8317 --db \"$PWD/.gateway/gateway.db\" --admin-password \"${ADMIN_PASSWORD:?先 export ADMIN_PASSWORD，或用 npm run gateway:init}\"",
+    "gateway:stop": "node src/cli.js stop",
+    "keys": "node src/cli.js keys list",
+    "keys:add": "node src/cli.js keys add",
+    "report": "node src/cli.js report",
+    "report:7d": "node src/cli.js report --days 7",
     "check": "bash test/check.sh",
-    "test": "node test/smoke-adapter.js && node test/smoke-client.js && node test/smoke-plugin.js && node test/smoke-login.js && node test/smoke-quota.js",
+    "test": "node test/smoke-adapter.js && node test/smoke-client.js && node test/smoke-plugin.js && node test/smoke-login.js && node test/smoke-quota.js && node test/smoke-gateway.js",
     "prepublishOnly": "npm run check"
   },
   "dsh": {

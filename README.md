@@ -26,11 +26,12 @@ macOS 优先、源码可审计、**凭据不出本机**。
 - 支持**图片输入**（多模态模型）：DSH 的图片块经 attachments 缝内联为 data URL；OpenAI 层也接受 `image_url`
 - 可选：在宿主已有的 web server 上挂一个 OpenAI 兼容面（`/v1/models`、`/v1/chat/completions`），**不自己占用端口**
 - 同时提供一个独立 CLI，可脱离 DSH 单独当本地代理跑
+- **可选网关模式（0.2.0 起）**：把同一个账号按人分发——每人一把 key、可设每日 token 上限、按人记账，并自带一个 `/admin` 管理页
 
 ## 它不做什么
 
 - 不代理、不中转、不上传任何凭据到第三方。**代码里出网的域名只有 Trae 官方域名**（见「出网清单」）。
-- 不共享额度给别人，不做多账号池，不做额度转卖。
+- 不做多账号池，不做额度转卖。网关模式（可选）只把**你自己的一个账号**分发给同事并记账，池化与转售仍不提供。
 - 不修改 Trae 客户端，不 hook 它的进程。
 
 ---
@@ -147,10 +148,11 @@ https://www.trae.cn/authorization?...&auth_callback_url=http://127.0.0.1:<port>/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/trae-cn/v1/models` | 模型列表 |
-| POST | `/trae-cn/v1/chat/completions` | 对话（流式 / 非流式，含 `reasoning_content` 与 tool calls） |
+| POST | `/trae-cn/v1/chat/completions` | 对话（含 `reasoning_content` 与 tool calls）。**`stream` 缺省为非流式**，与 OpenAI 规范一致；只有显式 `stream: true` 才返回 SSE |
 | GET | `/trae-cn/health` | 健康检查 |
 
-独立 CLI 也可以把同样的接口跑在自有端口上。注意独立进程的路径**没有** `/trae-cn` 前缀，直接就是 `/v1/...`：
+独立 CLI 也可以把同样的接口跑在自有端口上。注意独立进程的路径**没有** `/trae-cn` 前缀，直接就是 `/v1/...`
+（三种——DSH 内置 / 本地 serve / b2b 网关——的完整对照见后面的「三种接入方式」）：
 
 ```bash
 node src/cli.js login     # 浏览器登录
@@ -163,6 +165,155 @@ node src/cli.js chat "你好"
 > 任意一个页面都能对 `127.0.0.1` 上的这个端点发请求，用你的 Trae 登录态和额度跑模型。从 0.1.6 起，
 > 带 `Origin` 头的请求直接回 `403`，除非来源被加进 `allowBrowserOrigins`。服务端客户端（Hermes、
 > `openai-python`、`curl`）不发 `Origin`，行为不变。
+
+---
+
+## 网关模式：把模型分发给同事（单账号 + 按人记账）
+
+一个可选的能力：把上面的 OpenAI 兼容面开放到局域网，按人发 key，并记录每个人的用量。
+**仍然是同一个 Trae 账号**，不涉及多账号池，也不改变上游协议——只是在原有请求路径上插了鉴权和记账。
+
+加 `--db` 即开启：
+
+```bash
+node src/cli.js keys add alice --limit 200000   # 每人一把，上限 tokens/天
+node src/cli.js keys add bob                    # 不设上限
+node src/cli.js serve --host 0.0.0.0 --db --port 8317 --admin-password <口令>
+```
+
+启动后会打印所有可用的局域网地址：
+
+```
+  局域网入口（分布给同事）:
+              http://10.255.47.198:8317/v1   (en1)
+  鉴权:       按人发 key（已登记 2 把：alice, bob）
+  管理页:     http://127.0.0.1:8317/admin（需管理口令）
+```
+
+同事侧只需要三样：内网地址、**自己那把** `sk-...`、模型名（从 `/v1/models` 里选）。
+
+```bash
+curl -N http://10.255.47.198:8317/v1/chat/completions \
+  -H "Authorization: Bearer sk-alice-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Doubao-Seed-2.1-pro","stream":true,
+       "messages":[{"role":"user","content":"你好"}]}'
+```
+
+### key 怎么来
+
+**key 由你自己生成，与 Trae 无关。** Trae 侧那枚凭据（`~/.trae-proxy/credentials.json`）是给上游验身的，
+永远不该发给别人。发给同事的 `sk-<label>-<32 hex>` 由 `keys add` 或管理页生成，只与本地数据库核对。
+
+数据库里保存了**完整 key 和它的 SHA-256**：鉴权只读哈希，明文供管理员随时查看
+（管理页 `/admin` 或 `node src/cli.js keys show`）。这样分发后忘了发给谁、或对方丢了 key，
+不用重新签发一轮。
+
+代价要说清楚：**能读 `gateway.db` 的人就能读到所有 key**。该文件 0600，管理页有自己的口令，
+所以实际暴露面与旁边的凭据文件相同。
+
+- 泄漏了就 `keys disable <label>`，立即生效，不需要重启；
+- 彻底作废用 `keys rm <label>`（历史用量仍保留在报告里）。
+
+### 一键命令（`package.json`）
+
+日常最常用的几件事已预置成 npm 脚本：不加参数就是默认行为。
+
+| 命令 | 作用 |
+|---|---|
+| `npm run gateway:init -- --admin-password '口令'` | 首次配置，写 `~/.trae-proxy/gateway.json`（0600） |
+| `npm run gateway` | 按该配置启动 b2b 网关（读 host / port / db / 口令） |
+| `npm run gateway:local` | 不写配置文件、用本仓库 `.gateway/gateway.db`，口令取 `$ADMIN_PASSWORD` |
+| `npm run gateway:deepseek` | 同上，但默认模型固定为 `DeepSeek-V4.1-Flash-1017` |
+| `npm run gateway:stop` | 停掉配置端口上的网关进程 |
+| `npm run keys` | 查看 key 与今日用量 |
+| `npm run keys:add -- 张三 --limit 200000` | 建一把 key（完整值只打印一次） |
+| `npm run report` / `npm run report:7d` | 按人汇总用量（今日 / 近七天） |
+
+**为什么口令不写进 `package.json`：** 那个文件是要提交的。所以 `gateway` 从
+`~/.trae-proxy/gateway.json`（0600，已在 `.gitignore` 之外且不在仓库里）读口令，
+`gateway:local` 从环境变量 `ADMIN_PASSWORD` 读；两者都缺时**直接报错并给出修复提示**，
+不会悄悄用空口令起来。
+
+```bash
+# 首次（写配置，口令持久化在 0600 文件里）
+npm run gateway:init -- --admin-password '你的口令'
+npm run gateway
+
+# 或者完全不落盘（口令只存在于当前 shell）
+export ADMIN_PASSWORD='你的口令'
+npm run gateway:local
+```
+
+`--config` 指向的文件必须存在：写错路径会立刻报错，而不是静默退化成单用户模式
+（那会启动一个你以为不是的东西）。
+
+### 指定默认模型
+
+请求不传 `model`（或用 `auto` / `default`）时，默认落到**模型目录里的第一条** —— 而 Trae 的
+目录把 `Doubao-Seed-Evolving` 排在第一位。给同事用时，这通常不是他们想要的。
+
+```bash
+node src/cli.js serve --host 0.0.0.0 --db --admin-password '口令' \
+  --default-model DeepSeek-V4.1-Flash-1017
+# 或在 gateway.json 里写 "defaultModel": "DeepSeek-V4.1-Flash-1017"
+```
+
+配置后启动日志会打印一行 `默认模型: DeepSeek-V4.1-Flash-1017（请求不传 model 时使用）`。
+名字大小写不敏感，也接受 `model_name` / 显示名 / 子串（`1017` 同样命中）。
+显式传 `model` 时仍然以调用方为准；配置的模型若已从目录下线，会**退回目录第一条并打印警告**，
+而不是让每个请求都 404。
+
+### 三个命令够日常用
+
+```bash
+node src/cli.js keys list                 # key + 今日 tokens/上限 + 状态
+node src/cli.js keys disable alice        # 立即停用（401 → 403）
+node src/cli.js report --days 7           # 按人汇总
+node src/cli.js report --days 1
+```
+
+`report` 的输出按人分组，并单列「中断」与「上游错误」：
+
+```
+caller              请求      tokens      占比      中断      上游错误      被拒
+bob                  1         123     61%       0         0       0
+alice                2          78     39%       0         1       0
+unknown              2           0      0%       0         0       2
+合计                   5         201    100%       0         1       2
+```
+
+`unknown` 那一行是**鉴权失败**的请求（无效/无 key），它们不产生 token，但被记下来——
+否则一枚被翻找的 key 在你这里毫无痕迹。
+
+### 管理页
+
+`serve` 起好之后访问 `http://<host>:<port>/admin`（Basic Auth，口令即 `--admin-password`）。
+页面给出今日请求数、总 tokens、key 启停、每人用量排行、按模型分布、最近请求明细，并可以新建 key、
+改上限、停用、删除。渲染在服务端完成，**没有前端构建步骤**。
+
+管理页的鉴权是**独立**的：拿到 `/v1` key 的人打不开它。否则同事既能改自己的上限，也能看到所有人的用量。
+
+### 记账口径：三个必须知道的边界
+
+1. **每次请求都写一行**，包括客户端中途断开（`aborted`）和上游报错（`upstream_error`）。
+   只记成功的请求会让断流的人从报告里消失，而他往往是烧得最多的那个。
+2. **`notify_usage` 不是 token 用量。** 那是网关下发的余额快照，不能直接当扣费依据；
+   它被单独存到 `quota_snapshots`，只用来和账号余额做趋势对账。
+3. **企业席位的额度在控制台里按会话计量**，而 `trae-cn usage` 查的是个人积分账本，
+   所以它很可能长期显示 0 或一个不动的数字——**这不代表没人用**。看余额的「变化」而不是绝对值。
+
+### 安全边界（重要）
+
+- 网关监听 `0.0.0.0` 就等于**明文 HTTP 暴露在局域网**，没有 TLS。只应在可信内网使用。
+- 绑定非回环地址时，`serve` 会**拒绝启动**，除非你给了 `--db` 或 `--api-key`，
+  并且（网关模式下）给了 `--admin-password`。宁可不启动，也不做开放中继。
+- 带 `Origin` 头的浏览器请求依旧 `403`。如果同事用的是网页前端，让他走一层服务端代理。
+- 分发前记得关掉休眠，否则机器一睡服务就断：`sudo pmset -a sleep 0 disksleep 0 womp 1`。
+- 数据库在 `~/.trae-proxy/gateway.db`（`--db <path>` 可改）。里面是 key 的哈希和用量，**不含正文**——
+  对话内容不会落盘。
+
+`--db` 不传时 `serve` 与以前完全一致：可选单值 `--api-key`，没有数据库，没有管理页。
 
 ---
 
@@ -388,15 +539,17 @@ src/trae-client.js 上游客户端：目录 + SSE 解析 + 工具调用累积
 src/trae-auth.js   OAuth 登录、回调解析、令牌刷新（两种信封）
 src/trae-local-credentials.js 本机凭据读取（tc 解密 + 明文）
 src/openai-server.js OpenAI 兼容层
+src/store.js       网关数据库（SQLite）：keys / usage / quota_snapshots
+src/admin.js       B 端管理页与 /admin/api/*
 src/quota.js       只读额度快照（4008 排错用）
-src/cli.js         独立 CLI（login / models / serve / chat / usage）
+src/cli.js         独立 CLI（login / models / serve / chat / usage / keys / report）
 ```
 
 ## 开发
 
 ```bash
-npm run check     # 语法 + YAML + 清单一致性 + Config schema + 五套 smoke 测试（全部离线，mock fetch）
-npm test          # 只跑五套 smoke 测试
+npm run check     # 语法 + YAML + 清单一致性 + Config schema + 六套 smoke 测试（全部离线，mock fetch）
+npm test          # 只跑六套 smoke 测试
 ```
 
 smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**。五套分别覆盖：
@@ -406,6 +559,7 @@ smoke 测试全部用 stub fetch 拦截上游，**不需要凭据、不联网**�
 - `smoke-plugin.js` — **插件入口 `apply()`**：Config 是否是可被 cordis 校验的 Standard Schema、provider/adapter 是否按契约注册、挂载的 OpenAI 接口是否真的能应答，以及 **`prepareCall().stream()` 同步返回 AsyncIterable**（防 `[Symbol.asyncIterator] is not a function` 回归）
 - `smoke-quota.js` — 额度快照与 4008：摘要解析、405/business-code 报错、`formatQuota` 的零余额提示，以及 `4008` 的错误消息里必须带上 `notify_usage` 的额度
 - `smoke-login.js` — **`/trae-login` 命令全链路**：命令注册 → `webLogin` → 授权链接 → **合成 Trae 的真实回调** → 凭据落盘。它把 `openInApp` 换成桩（否则会真的弹出浏览器），并用 `TRAE_PROXY_CRED_DIR` 隔离凭据文件，**不会碰你真实的登录态**
+- `smoke-gateway.js` — **网关模式**：省略 `stream` 必须回 JSON 而非 SSE（否则官方 SDK 全部解析失败）、key 的哈希鉴权与明文回读、旧库自动迁移（补 `secret` 列）、中文 label 仍生成 `sk-<stem>-` 形状、停用与未知 key 可区分、日上限的边界（100/100 即触顶、被拒的请求不占额度、中断的请求占额度）、删 key 后历史用量仍在、**流式多 chunk 只写一行**、4008 记为 `upstream_error`、超限在**读请求体之前**就 429、中途断开记为 `aborted`、管理页鉴权与 `/v1` key 完全分离、跨站 POST 被拒，以及无 store 时仍退回单 key 模式。它用真实 `node:sqlite`（内存或临时文件）跑出真实 SQL，只 mock 上游 fetch
 
 另有两个**需要联网的手动脚本**（不在 `npm run check` 里）：
 
@@ -516,7 +670,7 @@ dsh plugin --profile desktop add trae-cn-provider   # 需先完全退出桌面�
 
 **2. `prepublishOnly` 会先跑完 `npm run check`。**
 
-所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、五套 smoke）。
+所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、六套 smoke）。
 
 ### 上架 dsh.so（社区插件市场）
 
@@ -573,44 +727,107 @@ npx -p @jieai/dsh-plugin-vet vet-gate --package node_modules/trae-cn-provider
 
 ---
 
+## 三种接入方式（先选对，接错是最高频的失败原因）
+
+同一个账号、同一份凭据，但**对外暴露的形态有三种**。它们的地址、鉴权、记账能力都不同，
+混用是绝大多数「能看到模型但一发消息就失败」或「记录对不上」的根源。
+
+| | A · DSH 内置 | B · 本地 serve | C · b2b 网关 |
+|---|---|---|---|
+| 启动 | DSH 自动挂载 | `npm run serve` | `npm run gateway` |
+| Base URL | `http://127.0.0.1:<DSH 端口>/trae-cn/v1` | `http://127.0.0.1:8317/v1` | `http://<内网IP>:8317/v1` |
+| 端口稳定 | ❌ 每次重启都变 | ✅ | ✅ |
+| API Key | **不校验**（占位符即可） | 可选单一 key | **必须真实存在于数据库** |
+| 谁能连 | 仅本机 | 仅本机（默认回环） | 局域网 |
+| 按人记账 | ❌ | ❌ | ✅ |
+| 管理页 `/admin` | ❌ | ❌ | ✅ |
+
+### A · DSH 内置（给 DSH 自己用）
+
+装好插件后 DSH 会自动把 `/trae-cn/v1` 挂到它自己的 web 端口上，**不需要任何额外启动步骤**。
+模型选择器里直接出现 Trae 的模型，这就是日常在 DSH 对话框里说话时走的路。
+
+```bash
+# 查当前端口（每次启动都变，别写死）
+lsof -nP -iTCP -sTCP:LISTEN | grep DeepSeek
+```
+
+这个端点**不校验 API Key**：插件在这里只服务本机，没有配置 `store`，鉴权分支会整体短路。
+所以 `api_key: trae-local` 这类占位符能通过，不传也能通过。
+
+### B · 本地 serve（固定端口，给本机其它工具用）
+
+```bash
+npm run serve -- --port 8317
+# 或：node src/cli.js serve --port 8317
+```
+
+默认只监听 `127.0.0.1`，不带 `--db` 时**没有 key 表、没有记账、没有管理页**，
+行为与网关模式出现之前完全一致。需要单一共享口令时加 `--api-key`。
+
+### C · b2b 网关（分发给同事，按人记账）
+
+见上一节「网关模式」。要点：`--host 0.0.0.0` + `--db` + `--admin-password`，
+key 由 `keys add` 或 `/admin` 生成，每个同事一把。
+
+---
+
 ## 让别的 agent 框架也用上（以 Hermes 为例）
 
 插件对外提供的是**标准 OpenAI 兼容端点**（`/v1/models` + `/v1/chat/completions`），任何支持自定义 OpenAI 端点的框架都能直接接入，**不需要改插件、也不需要第二次登录**。
 
-它有**两种暴露方式，端口和路径都不一样**，接错是最常见的失败原因：
+**推荐走 C（b2b 网关）**：端口固定、有真 key、调用进账本。Hermes 侧：
 
-| 方式 | Base URL | 端口稳定性 |
-|---|---|---|
-| DSH 宿主挂载（`mountOpenAIEndpoint: true`，默认） | `http://127.0.0.1:<DSH Web 端口>/trae-cn/v1` | ❌ DSH 桌面端每次启动都换端口 |
-| 独立进程 `node src/cli.js serve --port 8317` | `http://127.0.0.1:8317/v1` | ✅ 端口固定 |
+```yaml
+model:
+  provider: trae
+  base_url: "http://10.255.47.198:8317/v1"   # C：内网 IP + 固定端口
+  api_key: "sk-key-…"                        # C：真实的 key，不是占位符
+  api_mode: chat_completions
+  default: DeepSeek-V4.1-Flash-1017
 
-> ⚠️ **不要照抄具体端口号。** DSH 的 Web 端口是每次启动重新分配的（本机实测：`19387` → `54865` → `50455`，每次重启都换一个，旧端口上不再有进程监听）。同时独立进程的路径里**没有** `/trae-cn` 前缀。写死错的组合时表现就是：Hermes 能启动、模型列表也能看到，但一发消息就失败。
-
-**推荐的接法：用独立进程 + 固定端口。** 它不依赖 DSH 是否在跑，DSH 重启也不受影响：
-
-```bash
-node src/cli.js serve --port 8317          # 常驻，打印 http://127.0.0.1:8317/v1
-curl -s http://127.0.0.1:8317/v1/models | head -c 200   # 自检：应返回 20 个模型
+fallback_providers:
+  - provider: trae
+    model: glm-5.3-flash
+    base_url: http://10.255.47.198:8317/v1
+    api_key: sk-key-…
 ```
 
-然后改 `~/.hermes/config.yaml`：
+**也可以走 B（本地 serve）**，此时端点无鉴权，`api_key` 填任意非空字符串：
 
 ```yaml
 model:
   provider: trae
   base_url: "http://127.0.0.1:8317/v1"
-  api_key: "trae-local"        # 端点仅监听 127.0.0.1 且无鉴权，非空即可
+  api_key: "trae-local"        # B：端点无鉴权，非空即可
   api_mode: chat_completions
   default: glm-5.3
-
-providers:
-  trae:
-    base_url: "http://127.0.0.1:8317/v1"
-    api_key: "trae-local"
-    default_model: "glm-5.3"
 ```
 
-实测：Hermes 把它解析为自定义端点（`api_mode: chat_completions`），20 个模型全部可见，流式 / 非流式 / function calling 均可用。
+**不推荐走 A**：`127.0.0.1:<DSH端口>/trae-cn/v1` 虽然能通，但 DSH 每次重启端口都变，
+写死就会频繁 `Connection error`（实测 `19387` → `54865` → `50455` → `56672`）：
+
+```
+WARNING provider=custom base_url=http://127.0.0.1:19387/trae-cn/v1
+  model=glm-5.3 summary=Connection error. (attempt 1/3, 2/3, 3/3)
+```
+
+> ⚠️ **路径前缀也跟着方式走。** A 带 `/trae-cn`，B/C **没有**。`base_url` 写错端口或前缀时，
+> 表现是「模型列表能看到，但一发消息就失败」——这是最难自查的一类。
+
+实测（C 方式）：Hermes 解析为自定义端点（`api_mode: chat_completions`），23 个模型全部可见，
+流式 / 非流式 / function calling 均可用，且每次调用都记入 `/admin` 的账本。
+
+### 三种方式的鉴权差异（容易踩）
+
+| 方式 | `api_key` 填错会怎样 |
+|---|---|
+| A | **无所谓**，根本不校验 |
+| B | 未设 `--api-key` 时无所谓；设了则 401 |
+| C | **立刻 401**，且会在账本里留一行 `unknown` 记录 |
+
+所以从 B/A 切到 C 时，**必须同步换 key** —— 旧配置里的 `trae-local` 会被拒绝。
+同理，如果哪天在 `/admin` 停用了某把 key，用它的 Hermes 会立刻开始 401。
 
 两个前提：
 
@@ -718,6 +935,8 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.1** | **修「官方 SDK 拿不到回复」**：`stream` 缺省时服务返回 SSE，而 OpenAI 规范（以及官方 Python/Node 客户端）默认期望一次性 JSON —— 客户端把 SSE 正文当 JSON 解析，表现为 `choices` 为 `undefined` / 没有 content。现在只有显式 `stream: true` 才流式。另一处：`--default-model` 让省略 model 的请求不再落到目录首位的 `Doubao-Seed-Evolving`。均有回归测试 |
+| **0.2.0** | **网关模式（可选）**：`serve --db` 把 OpenAI 兼容面开放到局域网，按人发 key 并记账。新增 `src/store.js`（SQLite：keys 存哈希 + 明文 / usage / quota_snapshots，旧库自动补 `secret` 列）、`keys show` 子命令、管理页可直接复制完整 key 并在创建后自动刷新定位新行、中文 label 不再生成 `sk--key-`、`src/admin.js`（B 端管理页，口令鉴权与 `/v1` key 严格分离）、`keys add\|list\|rm\|enable\|disable\|limit` 与 `report` 子命令，以及 `serve --host`。记账覆盖成功/上游错误/客户端中断三种结局；日上限在解析请求体前判定；绑定非回环地址时强制要求 `--db`/`--api-key` 与 `--admin-password`，否则拒绝启动。新增 `smoke-gateway.js`（25 条断言，真实 `node:sqlite`） |
 | **0.1.8** | **修「登录成功却说没凭据」**：`catalog()` 以前会把 `MISSING_CREDENTIAL` 一起缓存 5 分钟（`CATALOG_RETRY_MS`）。全新安装时启动预拉取先失败一次，随后 `/trae-login` 成功，模型选择器却在窗口内继续重放那条缓存错误 —— 页面上就是「Trae CN 加载失败：no Trae CN credentials」，尽管 `~/.trae-proxy/credentials.json` 已经写好。现在**凭据类错误一律不缓存**（`MISSING_CREDENTIAL` / `REFRESH_FAILED` / `AUTH`），且 `/trae-login` 成功后调用 `adapter.invalidateCatalog()` 清空目录并立即预热，登录即刻生效。两条回归测试锁住 |
 | **0.1.7** | **企业账号 4008 修复**：企业流量必须打租户网关（凭据里的 `saasBootConfig.apiHost`，如 `console.enterprise.trae.cn`），且请求体必须带 `session_id`，否则消费版网关会按个人积分结算并回 `4008`——即使企业席位额度还有 ¥300。现在 `apiHostFor()` 自动选网关、`session_id`/`conversation_id` 固定随请求发送，企业控制台也能按会话看到用量。另加额度可观测：① 只读 `trae-cn usage`（`npm run usage`）查询 `web_user_ent_usage`，不消耗积分；② `notify_usage` 不再被当成 token usage；③ `4008` 带 `ide_credits`/`work_credits`/`billing_mode` 并被 DSH 归类为 `QUOTA`。文档新增「额度与用量（4008 排错）」 |
 | **0.1.6** | 安全加固，来自 dsh.so 动态审计的两条发现：① `/v1` 默认不再下发 `Access-Control-Allow-Origin: *`，带 `Origin` 头的请求一律 `403`（新增 `allowBrowserOrigins` 白名单）—— 以前任意网页都能用你的 Trae 额度；② `login-debug.log` 落盘前对回调参数脱敏，`userJwt` / `refreshToken` / `userInfo` 等敏感值替换成 `<redacted N>` —— 以前令牌会被复制到凭据文件之外。两条都有回归测试锁住 |
