@@ -887,36 +887,54 @@ fallback_providers:
 
 `billing` 类错误（余额不足的 429）在分类器里带 `should_fallback=True`，所以配好这条链之后，即使某个对话还钉在 zai 上，也会在真正发请求前切到 trae。
 
-### 常驻（macOS LaunchAgent）
+### 常驻：LaunchAgent（开机自启 + 崩溃自动重启）
 
-`~/Library/LaunchAgents/local.trae-cn-provider.plist`（`node` 换成 `command -v node` 的绝对路径）：
+`nohup ... &` 只是把进程丢到后台：终端关掉、误按 Ctrl+C、或一次 SIGTERM 它就没了，
+而外面所有拿着 key 的人都会看到 401/连接失败。真正常驻要用 launchd。
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>local.trae-cn-provider</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/opt/homebrew/bin/node</string>
-    <string>/path/to/trae-cn-provider/src/cli.js</string>
-    <string>serve</string>
-    <string>--port</string>
-    <string>8317</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/trae-cn-provider.log</string>
-  <key>StandardErrorPath</key><string>/tmp/trae-cn-provider.err.log</string>
-</dict>
-</plist>
-```
+仓库里带了一份现成的 plist（[deploy/local.trae-cn-provider.plist](./deploy/local.trae-cn-provider.plist)）：
 
 ```bash
-launchctl load -w ~/Library/LaunchAgents/local.trae-cn-provider.plist
-launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state = running
+cp deploy/local.trae-cn-provider.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.trae-cn-provider.plist
 ```
+
+它会执行 `serve --config ~/.trae-proxy/gateway.json`，也就是 `npm run gateway` 的同一条入口。
+口令与数据库路径都在那个 0600 的配置文件里，**plist 本身不含任何密钥** —— 这一点很重要，
+因为 `~/Library/LaunchAgents` 不是 0600，而且 `launchctl print` 会把 plist 内容原样打印出来。
+
+验证与日常操作：
+
+```bash
+launchctl print gui/$(id -u)/local.trae-cn-provider | grep -E 'state|pid'
+kill -TERM <pid>            # 杀掉试试，10 秒内会自动被拉起（KeepAlive）
+tail -f ~/Library/Logs/trae-cn-provider.log
+```
+
+停用/卸载：
+
+```bash
+launchctl bootout gui/$(id -u)/local.trae-cn-provider
+```
+
+> **一个必须知道的限制**：`~/Library/LaunchAgents` 只在**你登录桌面后**才加载。
+> 机器重启后如果停在登录界面，网关不会运行。要「开机即启、不依赖登录」，
+> 得把它装成 `/Library/LaunchDaemons/` 下的系统级 daemon（需要 root，且要以
+> 独立用户身份运行）——本仓库不默认这么做，因为那会让一个消耗个人额度的服务
+> 在无人登录时也可被访问。另外记得 `sudo pmset -a sleep 0 disksleep 0 womp 1`，
+> 否则机器睡眠时同样连不上。
+
+### 旧版 plist 的坑（升级时必须替换）
+
+0.1.x 时期流传的那份 plist 只带 `--port 8317`，**没有 `--db`**：
+
+```xml
+<string>serve</string><string>--port</string><string>8317</string>
+```
+
+用它启动的进程会退回**单 key 无记账**模式：`/admin` 是 404，`/v1` 不校验 key，
+用量也不进账本。升级到 0.2.x 后如果还留着它，表现为「网关好像跑了，但管理页打不开、
+报表里没有记录」。正确的做法是换成仓库里那份 `--config` 版本（见上一节）。
 
 > 顺带说明：**别指望直接读 Trae 客户端的登录态**（`credentialSource: local`）。新版 Trae CN 已把 `storage.json` 里的键名改为动态拼接的 `iCubeAuthInfo://icube-dc:<authProviderId>`，且该键解出来**只有设备密钥对、没有 token** —— 登录态迁到了 `state.vscdb`，那里也不存 token。`local` 因此在新版 CN 上读不到东西，属正常现象，用默认的 `oauth`。
 
@@ -946,6 +964,7 @@ launchctl print gui/$(id -u)/local.trae-cn-provider | head -20   # 确认 state 
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.4** | **常驻**：新增 `deploy/local.trae-cn-provider.plist`（`serve --config`，KeepAlive + RunAtLoad，plist 内不含任何密钥），README 补「崩溃自动重启」的安装/验证步骤，并说明 `~/Library/LaunchAgents` 只在登录后加载这一限制；同时标注 0.1.x 那份不带 `--db` 的旧 plist 必须替换（否则会静默退回单 key 无记账模式） |
 | **0.2.3** | **管理页重做**：视觉重排（卡片 / 表头 / 状态条 / 空态），时间范围支持快捷档与 `from`–`to` 日期选择器（`/admin/api/overview`、`/admin/api/requests` 均接受区间，按日序列补零不跳空日），key 行新增「复制网关地址 + key」且地址按访问者的 `Host` 自动适配，表头新增「复制全部 key」；共 29 条网关断言 |
 | **0.2.2** | **仅文档与元数据**：0.2.1 的 tarball 里 README/SECURITY 仍是 0.1.8 的内容（文档在发布之后才补），npm 不允许覆盖已发布版本，故提一个补丁版把「三种接入方式」、网关模式说明与 SECURITY 的 Gateway mode 一节一并带上。代码与 0.2.1 完全一致 |
 | **0.2.1** | **修「官方 SDK 拿不到回复」**：`stream` 缺省时服务返回 SSE，而 OpenAI 规范（以及官方 Python/Node 客户端）默认期望一次性 JSON —— 客户端把 SSE 正文当 JSON 解析，表现为 `choices` 为 `undefined` / 没有 content。现在只有显式 `stream: true` 才流式。另一处：`--default-model` 让省略 model 的请求不再落到目录首位的 `Doubao-Seed-Evolving`。均有回归测试 |

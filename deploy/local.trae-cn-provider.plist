@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.trae-cn-provider</string>
+
+  <!--
+    Runs `serve --config <gateway.json>`, which is the same entry point as
+    `npm run gateway`. The config file (0600) carries host/port/db/password,
+    so this plist holds no secrets itself.
+
+    Secrets are deliberately NOT in this plist: it lives in ~/Library/LaunchAgents,
+    which is not 0600, and plist values show up in `launchctl print`.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/ling/Dragonpass/trae-cn-provider/src/cli.js</string>
+    <string>serve</string>
+    <string>--config</string>
+    <string>/Users/ling/.trae-proxy/gateway.json</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/ling/Dragonpass/trae-cn-provider</string>
+
+  <!-- Start now, and again at every login. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!--
+    Restart on any exit, including a crash or an accidental SIGTERM.
+    `SuccessfulExit=false` is not used here on purpose: a clean exit is still
+    an outage for everyone holding a key, so it restarts either way.
+    `ThrottleInterval` keeps a crash-loop from hammering the CPU.
+  -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!--
+    No network dependency: the gateway only needs a local Trae login, and
+    both the machine's network and the upstream reachability are its own
+    concern. Waiting on the network would delay startup on a cold boot for
+    no benefit.
+  -->
+
+  <key>StandardOutPath</key>
+  <string>/Users/ling/Library/Logs/trae-cn-provider.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ling/Library/Logs/trae-cn-provider.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd starts with a minimal PATH; node's shebang and any spawned
+         helper (`open`, `lsof`) must be findable. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>
