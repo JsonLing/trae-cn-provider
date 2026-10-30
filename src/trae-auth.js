@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { parseExpiry, CRED_DIR } from './env.js';
+import { parseExpiry, CRED_DIR, hostPlatform } from './env.js';
 
 const API_HOST = 'https://api.trae.cn';
 const AUTHORIZE_URL = 'https://www.trae.cn/authorization';
@@ -20,6 +20,7 @@ const b64url = (buf) => Buffer.from(buf).toString('base64url');
 /** 生成设备密钥对与 DeviceInfo（登录与刷新必须用同一对，服务端会校验签名） */
 export function createDevice(ideVersion) {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const platform = hostPlatform();
   const deviceInfo = {
     DeviceID: crypto.randomUUID(),
     MachineID: crypto.createHash('sha512').update(crypto.randomUUID()).digest('hex'),
@@ -32,10 +33,10 @@ export function createDevice(ideVersion) {
     DeviceName: process.env.TRAE_PROXY_DEVICE_NAME
       || (os.hostname().split('.')[0] || 'TraeProxy'),
     DeviceModel: '',
-    DeviceBrand: '',
-    DeviceCPU: '',
-    OSInfo: 'macOS',
-    OSVersion: os.release(),
+    DeviceBrand: platform.DeviceBrand,
+    DeviceCPU: platform.DeviceCPU,
+    OSInfo: platform.OSInfo,
+    OSVersion: platform.OSVersion,
     ClientVersion: ideVersion,
     DevicePublicKey: publicKey.export({ type: 'spki', format: 'pem' }),
   };
@@ -332,7 +333,7 @@ export async function webLogin({ ideVersion, onAuthorizeUrl, onProgress, timeout
       device_id: device.deviceInfo.DeviceID,
       x_app_version: ideVersion,
       x_app_type: 'stable',
-      x_device_type: 'macOS',
+      x_device_type: hostPlatform().xDeviceType,
       code_challenge: challenge,
       code_challenge_method: 'S256',
     });

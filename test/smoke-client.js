@@ -42,6 +42,37 @@ await test('a local credential falls back to machineId for the device headers', 
   assertEqual(headers['x-machine-id'], 'machine-from-storage', 'x-machine-id');
 });
 
+await test('device headers follow the host platform instead of claiming to be a mac', async () => {
+  // These were hardcoded to Apple/Darwin/macOS, so a Windows install introduced
+  // itself to upstream as an Apple Silicon mac — a client/OS mismatch, and the
+  // kind of thing device checks look for. They now come from hostPlatform().
+  const { hostPlatform } = await load('src/env.js');
+  const headers = ideHeaders({ token: 't', userId: 'u', deviceInfo: { DeviceID: 'd', MachineID: 'm' } }, ENV);
+  const host = hostPlatform();
+
+  assertEqual(headers['x-device-type'], host.xDeviceType, 'x-device-type');
+  assertEqual(headers['x-device-brand'], host.DeviceBrand, 'x-device-brand');
+  assertEqual(headers['x-device-cpu'], host.cpu, 'x-device-cpu');
+  assertEqual(headers['x-system-type'], host.systemType, 'x-system-type');
+  assert(
+    headers['x-os-version'].startsWith(host.OSInfo),
+    `x-os-version starts with ${host.OSInfo}, got ${headers['x-os-version']}`,
+  );
+
+  // The Windows shape specifically: no Apple strings may survive there.
+  const win = hostPlatform({}, 'win32');
+  assertEqual(win.xDeviceType, 'windows', 'win32 x-device-type');
+  assertEqual(win.systemType, 'Windows_NT', 'win32 x-system-type');
+  assert(!/Apple|Darwin|macOS/.test(JSON.stringify(win)), `win32 identity has no Apple fields: ${JSON.stringify(win)}`);
+
+  // And the login DeviceInfo the same values feed.
+  const { createDevice } = await load('src/trae-auth.js');
+  const device = createDevice('3.4.6').deviceInfo;
+  assertEqual(device.OSInfo, host.OSInfo, 'DeviceInfo.OSInfo');
+  assertEqual(device.DeviceBrand, host.DeviceBrand, 'DeviceInfo.DeviceBrand');
+  assertEqual(device.DeviceCPU, host.DeviceCPU, 'DeviceInfo.DeviceCPU');
+});
+
 await test('refresh uses the account host, not a hardcoded api.trae.cn', async () => {
   const mock = mockFetch((url, init) => {
     assertEqual(

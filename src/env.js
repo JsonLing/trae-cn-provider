@@ -3,10 +3,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const APP_PATHS = [
-  '/Applications/Trae CN.app/Contents/Resources/app',
-  path.join(os.homedir(), 'Applications/Trae CN.app/Contents/Resources/app'),
-];
+// 安装位置按平台探测。Windows 上是 NSIS 安装出的 `Trae CN\resources\app`
+// （product.json 与 macOS 同构），漏掉它会让 x-ide-version 永远退到 FALLBACK。
+const WIN_INSTALL_ROOTS = ['LOCALAPPDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)']
+  .map((name) => process.env[name])
+  .filter(Boolean);
+
+const APP_PATHS = process.platform === 'win32'
+  ? [
+      ...WIN_INSTALL_ROOTS.map((root) => path.join(root, 'Programs/Trae CN/resources/app')),
+      ...WIN_INSTALL_ROOTS.map((root) => path.join(root, 'Trae CN/resources/app')),
+    ]
+  : [
+      '/Applications/Trae CN.app/Contents/Resources/app',
+      path.join(os.homedir(), 'Applications/Trae CN.app/Contents/Resources/app'),
+    ];
 
 // x-ide-version / x-ide-version-code 必须与真实构建一致，
 // 用旧固定值会让 get_detail_param 返回旧（残缺）模型目录。
@@ -40,6 +51,50 @@ export function detectEnv() {
     }
   }
   return { ...FALLBACK, ideVersionCode: String(FALLBACK.appVersionCode), source: 'fallback' };
+}
+
+/**
+ * The OS/CPU identity this host should present to upstream.
+ *
+ * These values were once hardcoded to macOS across `trae-auth.js` and
+ * `trae-client.js`, which made a Windows install claim to be an Apple Silicon
+ * mac — the kind of client/OS mismatch upstream device checks look for. They
+ * stay overridable so a future probe can pin a known-good string.
+ * @param {object} [env] - environment to read overrides from.
+ * @param {string} [platform] - `process.platform` value.
+ */
+export function hostPlatform(env = process.env, platform = process.platform) {
+  if (platform === 'win32') {
+    return {
+      OSInfo: env.TRAE_PROXY_OS_INFO || 'Windows',
+      OSVersion: env.TRAE_PROXY_OS_VERSION || os.release(),
+      DeviceBrand: env.TRAE_PROXY_DEVICE_BRAND || 'PC',
+      DeviceCPU: env.TRAE_PROXY_DEVICE_CPU || 'x64',
+      xDeviceType: 'windows',
+      systemType: 'Windows_NT',
+      cpu: 'x64',
+    };
+  }
+  if (platform === 'darwin') {
+    return {
+      OSInfo: 'macOS',
+      OSVersion: os.release(),
+      DeviceBrand: 'Apple',
+      DeviceCPU: 'Apple Silicon',
+      xDeviceType: 'macos',
+      systemType: 'Darwin',
+      cpu: 'Apple Silicon',
+    };
+  }
+  return {
+    OSInfo: env.TRAE_PROXY_OS_INFO || 'Linux',
+    OSVersion: env.TRAE_PROXY_OS_VERSION || os.release(),
+    DeviceBrand: env.TRAE_PROXY_DEVICE_BRAND || 'PC',
+    DeviceCPU: env.TRAE_PROXY_DEVICE_CPU || 'x64',
+    xDeviceType: 'linux',
+    systemType: 'Linux',
+    cpu: 'x64',
+  };
 }
 
 // Overridable so a test (or an operator with an unusual layout) can keep the

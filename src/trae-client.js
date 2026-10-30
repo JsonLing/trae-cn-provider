@@ -1,6 +1,6 @@
 // trae-client.js - 上游调用：模型目录 + /api/agent/v3/llm_utils_chat (SSE)
 import crypto from 'node:crypto';
-import os from 'node:os';
+import { hostPlatform } from './env.js';
 
 const CHAT_HOST = 'https://trae-api-cn.mchost.guru';
 const SG_CHAT_HOST = 'https://a0ai-api-sg.byteintlapi.com';
@@ -35,6 +35,13 @@ export function apiHostFor(creds) {
 }
 
 export function ideHeaders(creds, env, { sse = false } = {}) {
+  // Device identity must follow the host: hardcoding Apple/Darwin made a
+  // Windows install present itself as an Apple Silicon mac, which is exactly
+  // the kind of client/OS mismatch upstream device checks look for.
+  const platform = hostPlatform();
+  const osVersion = platform.xDeviceType === 'macos'
+    ? `macOS ${platform.OSVersion}`
+    : `${platform.OSInfo} ${platform.OSVersion}`;
   return {
     'Content-Type': 'application/json',
     Authorization: `Cloud-IDE-JWT ${creds.token}`,
@@ -52,11 +59,11 @@ export function ideHeaders(creds, env, { sse = false } = {}) {
     'x-ide-version': env.ideVersion,
     'x-ide-version-code': String(env.appVersionCode ?? env.ideVersionCode),
     'x-ide-version-type': 'stable',
-    'x-device-cpu': 'Apple Silicon',
-    'x-device-brand': 'Apple',
-    'x-device-type': 'macos',
-    'x-os-version': `macOS ${os.release()}`,
-    'x-system-type': 'Darwin',
+    'x-device-cpu': platform.cpu,
+    'x-device-brand': platform.DeviceBrand,
+    'x-device-type': platform.xDeviceType,
+    'x-os-version': osVersion,
+    'x-system-type': platform.systemType,
     Accept: sse ? 'text/event-stream' : 'application/json',
   };
 }

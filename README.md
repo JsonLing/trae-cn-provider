@@ -77,6 +77,32 @@ https://www.trae.cn/authorization?...&auth_callback_url=http://127.0.0.1:<port>/
 凭据默认落在 `~/.trae-proxy/credentials.json`（权限 `0600`）。若 DSH 的 `credentials` 服务可用，会优先存进那里。
 目录可以用环境变量 `TRAE_PROXY_CRED_DIR` 覆盖（测试用它做隔离；也可以在你想把凭据放到别处时用）。
 
+#### Windows：`Authorization failed: Error: 参数异常，请重新登录`
+
+0.2.5 之前，Windows 上执行 `/trae-login` 会出现这条报错，而终端里没有报错。
+
+原因是**打开浏览器的那一行把 URL 截断了**。旧代码用 `cmd /c start "" <url>` 打开授权页，
+而 Node 只在参数含空格或双引号时才给它加引号——授权 URL 两样都没有。于是 `cmd` 拿到的是
+没加引号的查询串，在第一个 `&` 处断开，浏览器实际打开的只是：
+
+```
+https://www.trae.cn/authorization?login_version=1
+```
+
+企业控制台前端有一条守卫（`Le()`，位于 `console.enterprise.trae.cn` 的 `index-*.js`）：
+
+```js
+if(!loginTraceId||!authCallbackURL||!deviceId||!authFrom)return"missing-params";
+```
+
+四个参数全被切掉，于是返回 `missing-params`，随后抛出 `参数异常，请重新登录`。
+这条文案来自 **Trae 控制台**，不是本插件；浏览器侧呈现出来的就是那一大段
+`index-*.js` 堆栈，而插件的本地回调监听器还在等，所以看起来像"卡住"。
+
+0.2.5 起改用 `rundll32 url.dll,FileProtocolHandler`——URL 作为**单个 argv** 传入，
+不经过 shell 重解析，`&` 不会再被切开。回归测试锁住三点：
+启动命令不是 `cmd`、URL 必须是单独一个参数、构建出的 URL 确实带齐那四个参数。
+
 ### `local`（可选，零摩擦）
 
 直接读本机 Trae 客户端的登录态，**不需要浏览器**。支持两种存储格式，运行时自动嗅探：
@@ -964,6 +990,7 @@ launchctl bootout gui/$(id -u)/local.trae-cn-provider
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.5** | **修 Windows 登录「参数异常，请重新登录」**：`openBrowser()` 在 Windows 上走 `cmd /c start "" <url>`，而 Node 不给不含空白的参数加引号，`cmd` 于是在第一个 `&` 处截断，浏览器只打开 `?login_version=1`；企业控制台的 `Le()` 守卫因缺少 `auth_from`/`login_trace_id`/`device_id`/`auth_callback_url` 返回 `missing-params` 并抛出该文案，而插件的回调监听器仍在等。改用 `rundll32 url.dll,FileProtocolHandler`（URL 作为单一 argv，不经 shell）。同时修三处 Windows 平台假设：设备信息与请求头的 `OSInfo`/`x-device-type`/`x-device-brand`/`x-device-cpu`/`x-system-type` 由 `hostPlatform()` 按平台生成（以前写死成 macOS/Apple Silicon/Darwin），`detectEnv()` 补 Windows 安装路径（`%LOCALAPPDATA%\Programs\Trae CN\resources\app` 等）。新增回归测试 2 组（启动命令形态、设备头跟随平台） |
 | **0.2.4** | **常驻**：新增 `deploy/local.trae-cn-provider.plist`（`serve --config`，KeepAlive + RunAtLoad，plist 内不含任何密钥），README 补「崩溃自动重启」的安装/验证步骤，并说明 `~/Library/LaunchAgents` 只在登录后加载这一限制；同时标注 0.1.x 那份不带 `--db` 的旧 plist 必须替换（否则会静默退回单 key 无记账模式） |
 | **0.2.3** | **管理页重做**：视觉重排（卡片 / 表头 / 状态条 / 空态），时间范围支持快捷档与 `from`–`to` 日期选择器（`/admin/api/overview`、`/admin/api/requests` 均接受区间，按日序列补零不跳空日），key 行新增「复制网关地址 + key」且地址按访问者的 `Host` 自动适配，表头新增「复制全部 key」；共 29 条网关断言 |
 | **0.2.2** | **仅文档与元数据**：0.2.1 的 tarball 里 README/SECURITY 仍是 0.1.8 的内容（文档在发布之后才补），npm 不允许覆盖已发布版本，故提一个补丁版把「三种接入方式」、网关模式说明与 SECURITY 的 Gateway mode 一节一并带上。代码与 0.2.1 完全一致 |

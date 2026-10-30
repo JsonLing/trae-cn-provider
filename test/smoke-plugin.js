@@ -372,6 +372,65 @@ await test('a missing credential is a clear error, never a crash or a leak', asy
   }
 });
 
+await test('the Windows browser launcher keeps the whole authorize URL intact', async () => {
+  // Reported from a Windows install: `/trae-login` opened the browser, the user
+  // got `Authorization failed: Error: 参数异常，请重新登录`, and the plugin's
+  // loopback listener waited forever.
+  //
+  // Cause: the launcher ran `cmd /c start "" <url>`. Node quotes an argument
+  // only when it contains whitespace or a double quote, and an authorize URL
+  // has neither — so cmd received `...&auth_from=trae&auth_type=local`
+  // unquoted, split on the first `&`, and opened only
+  // `https://www.trae.cn/authorization?login_version=1`.
+  //
+  // The console's own guard (`Le()` in its index-*.js) returns "missing-params"
+  // when any of auth_from / login_trace_id / device_id / auth_callback_url is
+  // absent, and the caller throws `参数异常，请重新登录`. Both were verified
+  // against the live console: the truncated URL reproduces that exact message in
+  // the browser console, and the full URL on the same session does not.
+  const url =
+    'https://www.trae.cn/authorization?login_version=1&auth_from=trae&login_channel=native_ide' +
+    '&login_trace_id=trace&device_id=device&auth_callback_url=http%3A%2F%2F127.0.0.1%3A5555%2Fauthorize';
+
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const { command, args } = plugin.browserCommand(platform, url);
+    assert(!/cmd/i.test(command), `${platform}: must not go through cmd (it re-parses '&')`);
+    assert(args.includes(url), `${platform}: the URL must stay one argv entry, got ${JSON.stringify(args)}`);
+  }
+
+  // The four parameters the console requires must actually be in the URL `webLogin`
+  // builds, not just in this fixture. Driving `webLogin` directly keeps this
+  // independent of the command registry: `onAuthorizeUrl` fires synchronously
+  // when the loopback listener is up, and the promise is abandoned after it (the
+  // listener closes on timeout, which no assertion waits for).
+  const authModule = await load('src/trae-auth.js');
+  let captured = null;
+  const pending = authModule.webLogin({
+    ideVersion: '3.4.6',
+    onAuthorizeUrl: (value) => {
+      captured = value;
+    },
+    timeoutMs: 50,
+  });
+  pending.catch(() => {});
+  for (let i = 0; i < 200 && !captured; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert(captured, 'webLogin produced an authorize URL');
+
+  const authorize = new URL(captured);
+  for (const key of ['auth_from', 'login_trace_id', 'device_id', 'auth_callback_url']) {
+    assert(authorize.searchParams.get(key), `authorize URL carries ${key}`);
+  }
+
+  // And the launch command used for it never lets a shell split it.
+  const launch = plugin.browserCommand('win32', authorize.href);
+  assert(launch.args.includes(authorize.href), 'the built URL reaches the opener whole');
+  assert(!/cmd/i.test(launch.command), 'the built URL is not passed through cmd');
+  // Nothing is listening for the callback here; the loopback server is closed
+  // when `webLogin` times out, and this suite does not wait for it.
+});
+
 await test('the login command returns a result the host accepts', async () => {
   // `CommandResult` is a closed union validated at the registry boundary by
   // @deepseek-ai/dsh-commands (`normalizeResult` in its lib/index.js), which
