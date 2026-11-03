@@ -5,6 +5,14 @@ import { detectEnv, loadCredentials, saveCredentials } from './env.js';
 import { needsRefresh, refreshToken } from './trae-auth.js';
 import { chat, listModels, toTraeMessages } from './trae-client.js';
 import { STATUS } from './store.js';
+import {
+  ResponsesEmitter,
+  chatPayloadFromResponses,
+  errorCodeOf,
+  errorStatusOf,
+  errorTypeOf,
+  promptTextOf,
+} from './responses.js';
 
 const CATALOG_TTL_MS = 60 * 60 * 1000;
 const CATALOG_RETRY_MS = 5 * 60 * 1000;
@@ -196,14 +204,33 @@ function sseChunk(model, delta, finishReason = null) {
   })}\n\n`;
 }
 
+/**
+ * One Responses-API SSE frame.
+ *
+ * The `event:` field mirrors `type` because the official OpenAI SDKs dispatch
+ * on it, while Codex reads `type` out of the JSON. Sending both keeps the two
+ * families of client happy for the cost of one duplicated field.
+ */
+function sseEvent(event) {
+  return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
   res.end(body);
 }
 
-function sendError(res, status, message, type = 'invalid_request_error') {
-  sendJson(res, status, { error: { message, type, code: null } });
+/**
+ * Error body for a rejected request.
+ *
+ * `code` matters: Codex reads `error.code` out of the JSON body of a non-2xx
+ * response and maps a known code to a terminal error instead of a retryable
+ * one. Leaving it `null` — as this helper used to — makes a 404 look retryable
+ * and burns five backoff attempts before the user sees anything.
+ */
+function sendError(res, status, message, type = 'invalid_request_error', code = null) {
+  sendJson(res, status, { error: { message, type, code } });
 }
 
 async function readBody(req, limit = 32 * 1024 * 1024) {
@@ -498,6 +525,10 @@ export function createRequestHandler(
         }
       }
 
+      if (req.method === 'POST' && path === '/v1/responses') {
+        return handleResponses(req, res, { provider, recordUsage, caller, store, now });
+      }
+
       return sendError(res, 404, `未知路径: ${path}`, 'not_found');
     } catch (err) {
       recordUsage({ status: STATUS.upstreamError, error: err.message });
@@ -505,6 +536,161 @@ export function createRequestHandler(
       return sendError(res, 502, err.message, 'upstream_error');
     }
   };
+}
+
+/**
+ * `POST /v1/responses` — the OpenAI Responses API that Codex CLI requires.
+ *
+ * Codex sends `stream: true` and parses SSE; a non-streaming caller gets the
+ * same item list as a single JSON body. Both paths share {@link ResponsesEmitter}
+ * so the two cannot drift apart.
+ *
+ * Ordering matters here: the quota check and the model lookup both happen
+ * **before** any SSE byte is written, so a rejected caller gets a real HTTP
+ * error (429 / 404 / 503) that Codex reports as a terminal failure instead of
+ * a 200 stream that immediately dies.
+ */
+async function handleResponses(req, res, { provider, recordUsage, caller, store, now }) {
+  if (!provider.ready) {
+    recordUsage({ status: STATUS.upstreamError, error: 'provider not logged in' });
+    return sendError(res, 503, '尚未登录 Trae 账号', 'service_unavailable');
+  }
+
+  if (caller && store) {
+    const quota = store.checkQuota(caller);
+    if (!quota.allowed) {
+      recordUsage({ status: STATUS.deniedQuota, error: `daily cap ${quota.limit} reached` });
+      return sendError(
+        res,
+        429,
+        `今日额度已用尽（${quota.used}/${quota.limit} tokens），明日 00:00 重置`,
+        'insufficient_quota',
+        'insufficient_quota',
+      );
+    }
+  }
+
+  const payload = await readBody(req);
+  await provider.models();
+  const caps = provider.resolveModel(payload.model);
+  if (!caps) {
+    recordUsage({ model: payload.model ?? null, status: STATUS.upstreamError, error: 'unknown model' });
+    return sendError(res, 404, `未知模型: ${payload.model}`, 'invalid_request_error', 'model_not_found');
+  }
+
+  const chatPayload = chatPayloadFromResponses(payload);
+  const promptText = promptTextOf(payload.input);
+  const wantStream = payload.stream !== false;
+  // The upstream always streams; `wantStream` only controls what we write back.
+  const body = buildTraeBody(chatPayload, caps, true);
+  const modelId = caps.configName;
+  const sessionId = body.session_id ?? null;
+  // The same reverse-name table the tool declarations were built with, so a
+  // call comes back under the name the caller actually declared.
+  const emitter = new ResponsesEmitter({ model: caps.configName, stream: wantStream, toolNames: chatPayload.toolNames });
+
+  // SSE headers are only sent once the first frame exists. This is what keeps
+  // an upstream that fails *before* emitting anything (HTTP 500, 401, a bad
+  // catalog) answerable as a real status code: Codex maps a non-2xx body to a
+  // terminal error, whereas a 200 stream that immediately says `response.failed`
+  // looks like a disconnect and gets retried.
+  const openStream = () => {
+    if (res.headersSent) return;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+  };
+
+  // `opened` flips on the first frame actually written, so the catch blocks
+  // below know whether a status code is still available to them.
+  let opened = false;
+  const emit = (events) => {
+    if (!events.length) return;
+    openStream();
+    opened = true;
+    for (const event of events) res.write(sseEvent(event));
+  };
+
+  try {
+    if (!wantStream) {
+      let usage = null;
+      const result = await provider.withAuthRetry((creds) =>
+        chat({
+          creds,
+          env: provider.env,
+          body,
+          onEvent: (event) => {
+            if (event.type === 'text') emitter.textDelta(event.text);
+            else if (event.type === 'reason') emitter.reasonDelta(event.text);
+            else if (event.type === 'tool') emitter.toolCall(event);
+            else if (event.type === 'usage') usage = event.usage;
+          },
+        }),
+      );
+      usage = usage ?? result.usage ?? null;
+      emitter.complete({ usage, finishReason: result.finishReason, promptText });
+      recordUsage({ model: modelId, status: STATUS.ok, usage, sessionId });
+      return sendJson(res, 200, emitter.toJSON({ usage, promptText }));
+    }
+
+    const abort = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) abort.abort();
+    });
+
+    let usage = null;
+    try {
+      const result = await provider.withAuthRetry((creds) =>
+        chat({
+          creds,
+          env: provider.env,
+          body,
+          signal: abort.signal,
+          onEvent: (event) => {
+            if (res.writableEnded || res.destroyed) return;
+            if (event.type === 'text') emit(emitter.textDelta(event.text));
+            else if (event.type === 'reason') emit(emitter.reasonDelta(event.text));
+            else if (event.type === 'tool') emit(emitter.toolCall(event));
+            else if (event.type === 'usage') usage = event.usage;
+          },
+        }),
+      );
+      usage = usage ?? result.usage ?? null;
+      recordUsage({ model: modelId, status: STATUS.ok, usage, sessionId });
+      emit(emitter.complete({ usage, finishReason: result.finishReason, promptText }));
+      return res.end();
+    } catch (err) {
+      const aborted = abort.signal.aborted;
+      recordUsage({
+        model: modelId,
+        status: aborted ? STATUS.aborted : STATUS.upstreamError,
+        error: aborted ? 'client closed the connection' : err.message,
+        sessionId,
+      });
+      if (aborted || res.writableEnded) return undefined;
+      if (opened) {
+        // The stream is already committed; the failure has to travel in-band.
+        emit(emitter.failed({ code: errorCodeOf(err), message: err.message }));
+        return res.end();
+      }
+      // Nothing was written yet: answer with a real status code instead. The
+      // status matters as much as the code — Codex only treats a *429* with
+      // `insufficient_quota` as a terminal quota error, and a 502 as retryable.
+      return sendError(res, errorStatusOf(err), err.message, errorTypeOf(err), errorCodeOf(err));
+    }
+  } catch (err) {
+    // Reached only when the failure happens before the stream opened (model
+    // catalog, body parse, first upstream call). Report it as a real HTTP error.
+    recordUsage({ model: modelId, status: STATUS.upstreamError, error: err.message, sessionId });
+    if (opened && !res.writableEnded) {
+      emit(emitter.failed({ code: errorCodeOf(err), message: err.message }));
+      res.end();
+      return undefined;
+    }
+    return sendError(res, errorStatusOf(err), err.message, errorTypeOf(err), errorCodeOf(err));
+  }
 }
 
 /** A standalone server, used by the CLI (`serve`) and by tests. */

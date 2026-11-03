@@ -1,7 +1,7 @@
 # trae-cn-provider
 
 把 **Trae CN** 作为一个**原生 LLM provider** 接入 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）。
-安装后 Trae 的模型会直接出现在 DSH 的模型选择器里，也可以额外开出一个 OpenAI 兼容接口给 Cline / Claude Code 之类的客户端用。
+安装后 Trae 的模型会直接出现在 DSH 的模型选择器里，也可以额外开出一个 OpenAI 兼容接口给 Cline / Claude Code / **Codex CLI** 之类的客户端用。
 
 macOS 优先、源码可审计、**凭据不出本机**。
 
@@ -24,7 +24,8 @@ macOS 优先、源码可审计、**凭据不出本机**。
 - 模型自动出现在模型选择器（从 Trae 的模型目录实时拉取）
 - 支持流式正文、思考链（reasoning）、原生 function calling、上下文窗口、思考档位
 - 支持**图片输入**（多模态模型）：DSH 的图片块经 attachments 缝内联为 data URL；OpenAI 层也接受 `image_url`
-- 可选：在宿主已有的 web server 上挂一个 OpenAI 兼容面（`/v1/models`、`/v1/chat/completions`），**不自己占用端口**
+- 可选：在宿主已有的 web server 上挂一个 OpenAI 兼容面（`/v1/models`、`/v1/chat/completions`、`/v1/responses`），**不自己占用端口**
+- **Codex CLI 直连（0.2.6 起）**：原生实现 OpenAI Responses API，`wire_api = "responses"` 直接指过来，无需 LiteLLM 之类的中转
 - 同时提供一个独立 CLI，可脱离 DSH 单独当本地代理跑
 - **可选网关模式（0.2.0 起）**：把同一个账号按人分发——每人一把 key、可设每日 token 上限、按人记账，并自带一个 `/admin` 管理页
 
@@ -175,6 +176,7 @@ if(!loginTraceId||!authCallbackURL||!deviceId||!authFrom)return"missing-params";
 |---|---|---|
 | GET | `/trae-cn/v1/models` | 模型列表 |
 | POST | `/trae-cn/v1/chat/completions` | 对话（含 `reasoning_content` 与 tool calls）。**`stream` 缺省为非流式**，与 OpenAI 规范一致；只有显式 `stream: true` 才返回 SSE |
+| POST | `/trae-cn/v1/responses` | **OpenAI Responses API**，Codex CLI 走这条。`stream` 缺省为流式；`stream: false` 回一次性 JSON |
 | GET | `/trae-cn/health` | 健康检查 |
 
 独立 CLI 也可以把同样的接口跑在自有端口上。注意独立进程的路径**没有** `/trae-cn` 前缀，直接就是 `/v1/...`
@@ -191,6 +193,52 @@ node src/cli.js chat "你好"
 > 任意一个页面都能对 `127.0.0.1` 上的这个端点发请求，用你的 Trae 登录态和额度跑模型。从 0.1.6 起，
 > 带 `Origin` 头的请求直接回 `403`，除非来源被加进 `allowBrowserOrigins`。服务端客户端（Hermes、
 > `openai-python`、`curl`）不发 `Origin`，行为不变。
+
+---
+
+## 接 Codex CLI（Responses API）
+
+Codex CLI 在 2026 年 2 月废弃了 Chat Completions，现在只认 `wire_api = "responses"`，配成 `"chat"`
+会在**加载配置**这一步就退出：
+
+```
+Error loading config.toml: `wire_api = "chat"` is no longer supported.
+How to fix: set `wire_api = "responses"` in your provider config.
+```
+
+所以插件补了一个原生 `/v1/responses` 端点，把 Trae 的 `chat_v3` 流翻译成 Responses 事件序列，
+**不需要中间件、不需要额外进程**。`~/.codex/config.toml`：
+
+```toml
+model          = "DeepSeek-V4.1-Flash-1017"
+model_provider = "trae"
+
+[model_providers.trae]
+name     = "Trae CN"
+base_url = "http://127.0.0.1:8317/v1"   # 独立 serve 的端口；DSH 内置用 /trae-cn/v1
+env_key  = "TRAE_API_KEY"
+wire_api = "responses"                  # 唯一可选值，写错会直接启动失败
+```
+
+```bash
+export TRAE_API_KEY="sk-..."   # --api-key 或网关模式发的 key；本机回环可不设
+codex exec "在当前目录创建 hello.txt，写一行 codex-works"
+```
+
+实测（codex-cli 0.166.0-alpha.5.1 + 真实 Trae 上游）：模型会按 Codex 的工具协议调 `exec_command`、
+`apply_patch` 并读到结果，多轮之后文件确实被创建。`reasoning` 以 Codex 的 “thinking” 块显示，
+`/usage` 读到真实 token 数。
+
+### 三个只在真实 Codex 上才暴露的约定
+
+| 约定 | 不满足会怎样 |
+|---|---|
+| `response.completed.usage` 的四个计数**必须是整数** | 缺字段/给 `null` → 整轮报 `stream closed before response.completed` |
+| 工具名只能 `[A-Za-z0-9_-]{1,128}` | 上游整条请求挂掉：`trae 4027: tools.4.function.name: expected 1-128 ASCII letters…`。Codex 自带的 `multi_agent_v1` 命名空间工具因此会被改写成 `multi_agent_v1_spawn`，回传时再还原成 `{name:"spawn", namespace:"multi_agent_v1"}` |
+| 额度耗尽要回 **429 + `insufficient_quota`** | 只回 502/`upstream_error` 会被判为可重试，Codex 会白等 5 次退避；状态码和 body 缺一不可 |
+
+另外：`stream` 已经开出后（第一帧已写出）的错误只能走 `response.failed` 事件；只有**第一帧之前**
+的失败才拿得到真实 HTTP 状态码，所以配额、未知模型、未登录都放在预检阶段。
 
 ---
 
@@ -423,6 +471,7 @@ unknown              2           0      0%       0         0       2
 | 原生 function calling | 完整 `tool_calls`：`get_weather {"city":"北京"}` |
 | `finish` 语义 | 上游在带工具调用时也回 `finish_reason: "stop"`，已按实测改成 `{kind:'tool-calls'}` |
 | OpenAI 兼容层 | `/v1/models`、`/v1/chat/completions`（流式 + 非流式） |
+| Responses API | `/v1/responses`（流式 + 非流式），Codex CLI 0.166 真实跑通：多轮 `exec_command` / `apply_patch` 后文件确实落盘 |
 | 多模态图片输入 | 96×96 纯红 PNG 走**两条路径**都实测通过：DSH `{type:'image'}` 块 + attachments 缝，以及 OpenAI 层的 `image_url` data URL —— 模型均回答「红色」。脚本 `test/live-image.js` |
 | 企业版租户网关 | 目录 200/50 条 → 23 个可用模型；聊天必须带 `session_id`（否则 4001/4008），带后正文 + `token_usage` 正常；企业控制台按会话计量 |
 | 本机凭据 `tc` 解密 | `cn`（加密）/ `sg`（明文）两种格式均解出并调通上游 |
@@ -990,6 +1039,7 @@ launchctl bootout gui/$(id -u)/local.trae-cn-provider
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.6** | **接 Codex CLI**：新增 `src/responses.js` 与 `POST /v1/responses`（原生 OpenAI Responses API，流式 + 非流式），把 Trae `chat_v3` 的 `text`/`reason`/`tool` 事件翻成 `response.output_item.added|done`、`response.output_text.delta`、`response.reasoning_summary_text.delta`、`response.completed`。Codex CLI 0.166 起 `wire_api = "chat"` 已不可用（加载配置即退出），原先只能靠 LiteLLM 之类做协议翻译；现在直连即可。三处实测踩出来的硬约束：`response.completed.usage` 四个计数必须是整数（否则整轮报 `stream closed before response.completed`）、工具名只能是 `[A-Za-z0-9_-]{1,128}`（否则上游整条请求 4027 失败，故 Codex 的 `multi_agent_v1` 命名空间工具改写成 `multi_agent_v1_spawn` 并在回传时还原）、额度耗尽必须回 429 + `insufficient_quota`（只给 502 会被判可重试并白等 5 次退避）。`sendError` 顺带补上 `code` 字段（以前恒为 `null`，使 404 也看起来可重试）。新增 `test/smoke-responses.js`（22 条断言） |
 | **0.2.5** | **修 Windows 登录「参数异常，请重新登录」**：`openBrowser()` 在 Windows 上走 `cmd /c start "" <url>`，而 Node 不给不含空白的参数加引号，`cmd` 于是在第一个 `&` 处截断，浏览器只打开 `?login_version=1`；企业控制台的 `Le()` 守卫因缺少 `auth_from`/`login_trace_id`/`device_id`/`auth_callback_url` 返回 `missing-params` 并抛出该文案，而插件的回调监听器仍在等。改用 `rundll32 url.dll,FileProtocolHandler`（URL 作为单一 argv，不经 shell）。同时修三处 Windows 平台假设：设备信息与请求头的 `OSInfo`/`x-device-type`/`x-device-brand`/`x-device-cpu`/`x-system-type` 由 `hostPlatform()` 按平台生成（以前写死成 macOS/Apple Silicon/Darwin），`detectEnv()` 补 Windows 安装路径（`%LOCALAPPDATA%\Programs\Trae CN\resources\app` 等）。新增回归测试 2 组（启动命令形态、设备头跟随平台） |
 | **0.2.4** | **常驻**：新增 `deploy/local.trae-cn-provider.plist`（`serve --config`，KeepAlive + RunAtLoad，plist 内不含任何密钥），README 补「崩溃自动重启」的安装/验证步骤，并说明 `~/Library/LaunchAgents` 只在登录后加载这一限制；同时标注 0.1.x 那份不带 `--db` 的旧 plist 必须替换（否则会静默退回单 key 无记账模式） |
 | **0.2.3** | **管理页重做**：视觉重排（卡片 / 表头 / 状态条 / 空态），时间范围支持快捷档与 `from`–`to` 日期选择器（`/admin/api/overview`、`/admin/api/requests` 均接受区间，按日序列补零不跳空日），key 行新增「复制网关地址 + key」且地址按访问者的 `Host` 自动适配，表头新增「复制全部 key」；共 29 条网关断言 |
