@@ -82,6 +82,8 @@ echo "== smoke: gateway (keys, caps, usage ledger, admin) =="
 node test/smoke-gateway.js | tail -1
 echo "== smoke: responses (Codex CLI surface) =="
 node test/smoke-responses.js | tail -1
+echo "== smoke: codex catalog (model picker) =="
+node test/smoke-codex-catalog.js | tail -1
 
 echo
 echo "all checks passed"

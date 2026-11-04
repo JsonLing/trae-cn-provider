@@ -5,6 +5,7 @@ import { detectEnv, loadCredentials, saveCredentials } from './env.js';
 import { needsRefresh, refreshToken } from './trae-auth.js';
 import { chat, listModels, toTraeMessages } from './trae-client.js';
 import { STATUS } from './store.js';
+import { buildCatalog, catalogEtag } from './codex-catalog.js';
 import {
   ResponsesEmitter,
   chatPayloadFromResponses,
@@ -24,8 +25,11 @@ export class TraeProvider {
    *   resolves to. Without it the catalog's first entry wins, which is the
    *   upstream's ordering, not the operator's intent — and that entry is
    *   `Doubao-Seed-Evolving`, not the DeepSeek model a caller would expect.
+   * @param {object<string,string>} [options.aliases] - caller-facing model id ->
+   *   a Trae catalog name. Lets a client that hardcodes another provider's slug
+   *   (Codex's `deepseek-flash`) reach the equivalent Trae model instead of 404.
    */
-  constructor({ env = detectEnv(), credentials = null, logger = console, defaultModel = null } = {}) {
+  constructor({ env = detectEnv(), credentials = null, logger = console, defaultModel = null, aliases = null } = {}) {
     this.env = env;
     this.creds = credentials;
     this.logger = logger;
@@ -34,6 +38,9 @@ export class TraeProvider {
     this.catalogError = null;
     this.refreshing = null;
     this.defaultModel = defaultModel ? String(defaultModel) : null;
+    this.aliases = new Map(
+      Object.entries(aliases ?? {}).map(([from, to]) => [String(from).toLowerCase(), String(to)]),
+    );
   }
 
   get ready() {
@@ -101,6 +108,10 @@ export class TraeProvider {
    * Look up a catalog entry by any of its names.
    *
    * @param {string} [requested] - a `config_name`, `model_name`, display name,
+  /**
+   * Look up a catalog entry by any of its names.
+   *
+   * @param {string} [requested] - a `config_name`, `model_name`, display name,
    *   or a substring of any of them. Omitted / `auto` / `default` resolve to
    *   the configured default model, then to the catalog's first entry.
    * @returns {object|null}
@@ -120,6 +131,15 @@ export class TraeProvider {
         );
       }
       return this.catalog[0];
+    }
+    // An alias is tried before the fuzzy matcher: `deepseek-flash` would
+    // otherwise substring-match a Trae model with a similar name and silently
+    // route to the wrong one.
+    const alias = this.aliases?.get(want);
+    if (alias) {
+      const resolved = matchModel(this.catalog, alias.toLowerCase());
+      if (resolved) return resolved;
+      this.logger.warn?.(`[trae] 别名「${requested}」指向的${alias}不在模型目录里，回退到原样匹配`);
     }
     return matchModel(this.catalog, want);
   }
@@ -385,6 +405,25 @@ export function createRequestHandler(
             supports_vision: m.vision,
           })),
         });
+      }
+
+      // The model-picker catalog Codex reads via `model_catalog_url`. Distinct
+      // from `/v1/models` above: that one is the OpenAI list shape, this one is
+      // Codex's `ModelInfo` shape, which has no `object`/`data` envelope.
+      if (req.method === 'GET' && (path === '/v1/models/catalog' || path === '/models/catalog')) {
+        const catalog = buildCatalog(
+          await provider.models(),
+          provider.defaultModel,
+          // `aliases` is a Map on the provider; the builder takes a plain object.
+          provider.aliases?.size ? Object.fromEntries(provider.aliases) : null,
+        );
+        const etag = catalogEtag(catalog);
+        if (req.headers['if-none-match'] === etag) {
+          res.writeHead(304, { ETag: etag });
+          return res.end();
+        }
+        res.setHeader('ETag', etag);
+        return sendJson(res, 200, catalog);
       }
 
       if (req.method === 'POST' && path === '/v1/chat/completions') {

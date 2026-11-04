@@ -229,6 +229,53 @@ codex exec "在当前目录创建 hello.txt，写一行 codex-works"
 `apply_patch` 并读到结果，多轮之后文件确实被创建。`reasoning` 以 Codex 的 “thinking” 块显示，
 `/usage` 读到真实 token 数。
 
+### 让桌面 App 的下拉框列出 Trae 的模型
+
+桌面 App 的模型选择器和 CLI 走**两条不同的路**，这点实测踩过：
+
+| 路径 | 读什么 | 谁用 |
+|---|---|---|
+| `model_providers.<id>.model_catalog_url` | provider 的 `/v1/models/catalog` | **只有 CLI**（`codex debug models` 能看到 25 个） |
+| `model_catalog_json = "~/.codex/models.json"` | 本地文件 | **桌面 App 的下拉框** |
+
+我们先把 `model_catalog_url` 配好，CLI 一切正常，但 App 下拉框只显示「自定义」——
+因为 App 根本不渲染 provider 的目录。所以要让下拉框可用，必须生成那个文件：
+
+```bash
+node src/cli.js catalog:codex        # 或 npm run catalog:codex
+```
+
+它会从网关（不可用时回退直连上游）取目录，写入 `~/.codex/models.json`，
+并在 `config.toml` 里加：
+
+```toml
+model_catalog_json = "~/.codex/models.json"
+```
+
+**改完必须重启 App**：它只在启动时读这个文件，改文件不会热生效。
+
+两条这条路上才会踩到的坑：
+
+- **条目字段必须齐全。** Codex 反序列化 `ModelInfo` 是严格的，缺一个字段整条被
+  静默丢弃——不报错，下拉框就是空的或只有「自定义」。
+- **`instructions_template` 是"替换"而不是"追加"。** 它是整个系统提示词。用一句
+  `You are a coding agent...` 占位会让模型失去自我认知：实测在上一轮提到 DeepSeek
+  之后，问 `glm-5.3-flash` 它是谁，它会顺着上下文答"我是 DeepSeek"。所以
+  `catalog:codex` 会从 Codex 自带目录里取原文（约 21KB），只把
+  `You are Codex, an agent based on GPT-6.` 这句改写成当前模型名。
+
+### 模型别名
+
+Codex 桌面版自带一些 slug（`deepseek-flash`、`deepseek-v4-pro`）在上游不存在，
+选中会 404。网关配置里的 `aliases` 把它们映射到真实模型：
+
+```json
+{ "aliases": { "deepseek-flash": "DeepSeek-V4.1-Flash-1017" } }
+```
+
+别名会同时出现在目录里（可直接选）和 `resolveModel` 中（别名优先于模糊匹配，
+否则 `deepseek-flash` 会子串撞上 `DeepSeek-V4.1-Flash` 而路由到错模型）。
+
 ### 三个只在真实 Codex 上才暴露的约定
 
 | 约定 | 不满足会怎样 |
@@ -1039,6 +1086,7 @@ launchctl bootout gui/$(id -u)/local.trae-cn-provider
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.7** | **让 Codex 桌面版下拉框列出 Trae 模型**：新增 `src/codex-catalog.js`、`GET /v1/models/catalog` 与 `catalog:codex` 子命令。实测确认桌面 App **不读** provider 的 `model_catalog_url`（那条只有 CLI 生效），下拉框只认 `model_catalog_json` 指向的文件，所以改为生成 `~/.codex/models.json`（25 条完整 `ModelInfo`）。两个只有真机才会暴露的坑：① `ModelInfo` 反序列化严格，缺任一字段整条被静默丢弃，下拉框只剩「自定义」；② `instructions_template` 是**替换**整个系统提示词，用短占位会让模型失去自我认知——实测 `glm-5.3-flash` 会顺着上下文自称 DeepSeek，故 `catalog:codex` 从 Codex 自带目录取 21KB 原文，仅改写 `based on GPT-x` 那句身份声明。另新增 `aliases` 配置（`deepseek-flash` → Trae 的 DeepSeek），并修复 `sendError` 缺少 `code`。新增 `test/smoke-codex-catalog.js`（15 条断言） |
 | **0.2.6** | **接 Codex CLI**：新增 `src/responses.js` 与 `POST /v1/responses`（原生 OpenAI Responses API，流式 + 非流式），把 Trae `chat_v3` 的 `text`/`reason`/`tool` 事件翻成 `response.output_item.added|done`、`response.output_text.delta`、`response.reasoning_summary_text.delta`、`response.completed`。Codex CLI 0.166 起 `wire_api = "chat"` 已不可用（加载配置即退出），原先只能靠 LiteLLM 之类做协议翻译；现在直连即可。三处实测踩出来的硬约束：`response.completed.usage` 四个计数必须是整数（否则整轮报 `stream closed before response.completed`）、工具名只能是 `[A-Za-z0-9_-]{1,128}`（否则上游整条请求 4027 失败，故 Codex 的 `multi_agent_v1` 命名空间工具改写成 `multi_agent_v1_spawn` 并在回传时还原）、额度耗尽必须回 429 + `insufficient_quota`（只给 502 会被判可重试并白等 5 次退避）。`sendError` 顺带补上 `code` 字段（以前恒为 `null`，使 404 也看起来可重试）。新增 `test/smoke-responses.js`（22 条断言） |
 | **0.2.5** | **修 Windows 登录「参数异常，请重新登录」**：`openBrowser()` 在 Windows 上走 `cmd /c start "" <url>`，而 Node 不给不含空白的参数加引号，`cmd` 于是在第一个 `&` 处截断，浏览器只打开 `?login_version=1`；企业控制台的 `Le()` 守卫因缺少 `auth_from`/`login_trace_id`/`device_id`/`auth_callback_url` 返回 `missing-params` 并抛出该文案，而插件的回调监听器仍在等。改用 `rundll32 url.dll,FileProtocolHandler`（URL 作为单一 argv，不经 shell）。同时修三处 Windows 平台假设：设备信息与请求头的 `OSInfo`/`x-device-type`/`x-device-brand`/`x-device-cpu`/`x-system-type` 由 `hostPlatform()` 按平台生成（以前写死成 macOS/Apple Silicon/Darwin），`detectEnv()` 补 Windows 安装路径（`%LOCALAPPDATA%\Programs\Trae CN\resources\app` 等）。新增回归测试 2 组（启动命令形态、设备头跟随平台） |
 | **0.2.4** | **常驻**：新增 `deploy/local.trae-cn-provider.plist`（`serve --config`，KeepAlive + RunAtLoad，plist 内不含任何密钥），README 补「崩溃自动重启」的安装/验证步骤，并说明 `~/Library/LaunchAgents` 只在登录后加载这一限制；同时标注 0.1.x 那份不带 `--db` 的旧 plist 必须替换（否则会静默退回单 key 无记账模式） |

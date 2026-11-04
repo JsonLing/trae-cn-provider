@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // cli.js - login / models / serve / chat / usage / keys / report
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,6 +12,7 @@ import { fetchQuota, formatQuota, tenantOf } from './quota.js';
 import { TraeProvider, startServer } from './openai-server.js';
 import { openStore, startOfToday, SQLITE_HELP, keyStem } from './store.js';
 import { createAdminHandler } from './admin.js';
+import { adaptInstructions, buildCatalog } from './codex-catalog.js';
 
 /** Where the gateway database lives unless `--db` says otherwise. */
 export const DEFAULT_DB = path.join(CRED_DIR, 'gateway.db');
@@ -108,6 +109,107 @@ async function cmdModels() {
   }
 }
 
+/**
+ * Write the model-picker catalog the Codex **desktop** app reads.
+ *
+ * The desktop picker does not render a provider's `model_catalog_url`; it only
+ * reads the file named by `model_catalog_json` (measured: the endpoint was
+ * fetched and answered 200, yet the picker showed only "Custom"). So the
+ * catalog has to be materialised on disk and that config key pointed at it.
+ *
+ * Run this again whenever the upstream model list changes — it is a snapshot,
+ * not a live fetch.
+ */
+/**
+ * Read Codex's own instruction text out of its bundled catalog.
+ *
+ * `instructions_template` replaces Codex's entire system prompt, so a stub
+ * makes the model forget who it is (measured: it then answers "which model are
+ * you?" with whatever names appeared earlier in the conversation). The real
+ * text lives in the client, so we ask it rather than shipping a copy that would
+ * drift with every Codex release.
+ * @returns {Promise<string|null>}
+ */
+function codexInstructions() {
+  const candidates = [
+    process.env.CODEX_CLI_PATH,
+    '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+  ].filter(Boolean);
+  for (const bin of candidates) {
+    if (!fs.existsSync(bin)) continue;
+    try {
+      const out = execFileSync(bin, ['debug', 'models', '--bundled'], { encoding: 'utf8', timeout: 20000 });
+      const parsed = JSON.parse(out);
+      for (const model of parsed?.models ?? []) {
+        const text = model?.model_messages?.instructions_template ?? model?.base_instructions;
+        if (typeof text === 'string' && text.trim()) return text;
+      }
+    } catch {
+      // A Codex build without `debug models` is not fatal: the fallback prompt
+      // still satisfies the schema requirement, just with less fidelity.
+    }
+  }
+  return null;
+}
+
+async function cmdCatalogCodex() {
+  const { flags } = parseArgs(process.argv.slice(3));
+  const configFile = typeof flags.config === 'string' ? path.resolve(flags.config) : DEFAULT_CONFIG;
+  const config = readConfig(configFile, { required: false });
+  const target = path.resolve(
+    String(flags.out ?? process.env.CODEX_MODELS_JSON ?? path.join(os.homedir(), '.codex', 'models.json')),
+  );
+  const baseUrl = String(flags.url ?? `http://127.0.0.1:${config.port ?? 8317}`).replace(/\/+$/, '');
+  const apiKey = flags['api-key'] ?? process.env.API_KEY ?? config.apiKey ?? null;
+
+  // Prefer the running gateway: it already holds a refreshed catalog and the
+  // per-person accounting. Falling back to a direct upstream call keeps the
+  // command usable before `serve` is started.
+  let catalog;
+  try {
+    const res = await fetch(`${baseUrl}/v1/models/catalog`, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`);
+    catalog = await res.json();
+  } catch (err) {
+    console.log(`网关不可用（${err.message.slice(0, 80)}），改为直连上游拉取…`);
+    const provider = new TraeProvider({
+      credentials: requireCredentials(),
+      defaultModel: config.defaultModel ?? null,
+      aliases: config.aliases ?? null,
+    });
+    catalog = buildCatalog(await provider.models({ force: true }), provider.defaultModel, config.aliases ?? null);
+  }
+
+  let models = Array.isArray(catalog.models) ? catalog.models : [];
+  if (!models.length) throw new Error('目录为空：未取到任何模型，未写入文件');
+
+  // The gateway's own catalog route may predate instruction injection, so
+  // re-apply it here: every entry must carry a real system prompt.
+  const instructions = codexInstructions();
+  // Always overwrite with Codex's real prompt. The gateway may have injected
+  // its own short fallback, and a short template REPLACES the system prompt,
+  // leaving the model with no idea which model it is.
+  models = models.map((entry) => {
+    const template = adaptInstructions(instructions, entry.display_name ?? entry.slug);
+    return { ...entry, model_messages: { ...(entry.model_messages ?? {}), instructions_template: template } };
+  });
+  console.log(
+    instructions
+      ? '  指令文本: 取自 Codex 自带目录'
+      : '  指令文本: 未找到 Codex，使用内置兜底（模型自我认知可能不准）',
+  );
+
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(target, `${JSON.stringify({ models }, null, 1)}\n`, { mode: 0o644 });
+  console.log(`已写入 ${target}`);
+  console.log(`  模型 ${models.length} 个，默认 ${models[0].slug}`);
+  console.log('  让 Codex 桌面版用上它，config.toml 需要这一行：');
+  console.log(`    model_catalog_json = "${target}"`);
+  console.log('  然后重启 Codex 桌面版（它只在启动时读这个文件）。');
+}
+
 /** Where the gateway config lives by default (next to the database). */
 export const DEFAULT_CONFIG = path.join(CRED_DIR, 'gateway.json');
 
@@ -161,6 +263,10 @@ async function cmdServe() {
   // ordering puts Doubao first, so without this a gateway handed to colleagues
   // silently answers with a model nobody asked for.
   const defaultModel = flags['default-model'] ?? process.env.DEFAULT_MODEL ?? config.defaultModel ?? null;
+  // Caller-facing model id -> Trae catalog name. Lets a client that hardcodes
+  // another provider's slug reach the equivalent Trae model (Codex's model
+  // picker ships `deepseek-flash` / `deepseek-v4-pro`).
+  const aliases = config.aliases ?? null;
 
   // Gateway mode is opt-in: `--db` (with or without a path) turns on the key
   // table, the daily caps and the usage ledger. Without it `serve` behaves
@@ -201,7 +307,7 @@ async function cmdServe() {
     process.exit(1);
   }
 
-  const provider = new TraeProvider({ credentials: requireCredentials(), defaultModel });
+  const provider = new TraeProvider({ credentials: requireCredentials(), defaultModel, aliases });
   // The admin header wants the account balance, which is a networked call. It
   // is cached for five minutes and refreshed in the background: an operator
   // opening the page must never wait on the dashboard endpoint, and a balance a
@@ -673,6 +779,7 @@ async function cmdStop() {
 const commands = {
   login: cmdLogin,
   models: cmdModels,
+  'catalog:codex': cmdCatalogCodex,
   serve: cmdServe,
   chat: cmdChat,
   usage: cmdUsage,
@@ -685,10 +792,12 @@ const commands = {
 
 const command = process.argv[2];
 if (!commands[command]) {
-  console.log('用法: node src/cli.js <login|models|init|serve|stop|chat|usage|keys|report>');
+  console.log('用法: node src/cli.js <login|models|catalog:codex|init|serve|stop|chat|usage|keys|report>');
   console.log('');
   console.log('  login                  浏览器登录 Trae 账号');
   console.log('  models                 列出可用模型');
+  console.log('  catalog:codex [--out <file>] [--url <base>]');
+  console.log('                         生成 Codex 桌面版下拉框读取的 ~/.codex/models.json');
   console.log('  init [--admin-password <pw>] [--host 0.0.0.0] [--port 8317] [--default-model <id>]');
   console.log('                         生成 npm run gateway 用的配置（0600）');
   console.log('  serve [--host 0.0.0.0] [--db] [--admin-password <pw>] [--default-model <id>] [--config <file>]');
