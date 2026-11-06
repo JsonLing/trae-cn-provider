@@ -430,6 +430,9 @@ unknown              2           0      0%       0         0       2
 
 1. **每次请求都写一行**，包括客户端中途断开（`aborted`）和上游报错（`upstream_error`）。
    只记成功的请求会让断流的人从报告里消失，而他往往是烧得最多的那个。
+   **失败行也带 token**：上游的 `token_usage` 在正文之后、`done` 之前下发，所以断开/报错时它通常已经到了，
+   0.2.9 起这些 token 会被保留（0.2.8 及以前一律记 0，报表因此系统性偏小）。
+   只有在 `token_usage` 到达**之前**就断开，才会是 0 —— 那是上游还没回传，不是丢数据。
 2. **`notify_usage` 不是 token 用量。** 那是网关下发的余额快照，不能直接当扣费依据；
    它被单独存到 `quota_snapshots`，只用来和账号余额做趋势对账。
 3. **企业席位的额度在控制台里按会话计量**，而 `trae-cn usage` 查的是个人积分账本，
@@ -975,6 +978,8 @@ WARNING provider=custom base_url=http://127.0.0.1:19387/trae-cn/v1
 | `ECONNREFUSED 127.0.0.1:<port>`，Hermes 日志出现 `probe-down` | base_url 的端口没有进程监听 | 按上表重新确认端口；DSH 重启后必须换成新端口，或改用固定端口的独立进程 |
 | 模型列表里只有 `zai` 的模型、看不到 `trae` | `providers.trae` 没被读入，或 base_url 连不上导致模型发现失败 | `hermes config get providers.trae`；先 `curl` 自检端点 |
 | `trae 4008: Your requests have exceeded the quota.` | 账号可用额度为 0（`notify_usage` 里全是 0）；企业账号的额度池按会话计费，直连调用看不到 | `npm run usage` 查余额；判断方法见「额度与用量（`4008` 排错）」 |
+| `413 request_too_large` | 请求体超过 32 MB（0.2.8 起是一个明确的客户端错误，以前会让整个进程崩掉） | 裁剪上下文/附件后重试。这不是可重试错误，Codex 会立刻报出来而不是退避 5 次 |
+| 网关「自己重启了」/ 日志里一串 `请求体过大` 后跟新进程启动 | 0.2.8 之前的 unhandled rejection：任何一个超大请求体都能打挂进程，launchd 再把它拉起来 | 升级到 0.2.8 及以上；`grep 请求体过大 ~/Library/Logs/trae-cn-provider.err.log` 可确认是否中过 |
 
 > **模型名会撞车。** Trae 和 Z.AI 都有 `glm-5.2` / `glm-5.3`。只写模型名时，Hermes 可能把 `glm-*` 解析回 Z.AI 的 `zai` provider，于是又变成余额报错。选模型时要选 **trae 分组**下的那个，而不是 `zai` 分组下的同名项。
 
@@ -1086,6 +1091,8 @@ launchctl bootout gui/$(id -u)/local.trae-cn-provider
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.9** | **修「token 统计少算」——中断与失败请求的 token 被整段丢掉**：上游的 `token_usage` 帧在正文之后、`done` **之前**下发，而 `chat()` 只在正常返回时带出 `usage`；一旦中途抛错（客户端断开、上游 `error` 帧、流被截断），已经收到的 `token_usage` 就随异常一起被丢弃，网关只能记一行 `total_tokens = 0`。实测复现：客户端在上游回 `token_usage` 后断开，上游已按 1500 tokens 计费，账本记 0。**这不是边角情况**：正文流完后用户点「停止」、Codex 取消、或上游在最后一帧报错，都会命中 —— 那正是最贵的几类行（`aborted` / `upstream_error`），报表因此系统性偏小，日上限也压不住真正的大户。修法：`src/trae-client.js` 新增 `withUsage()`，把已收到的 `usage` 挂到抛出的错误上（`AbortError` 也保留 —— 网关靠它区分 `aborted` 与 `upstream_error`），三处记录点（chat 流式 / responses 流式 / responses 外层）改为从 `err.usage` 取。**注意边界**：若在 `token_usage` 到达**之前**就断开，上游确实还没回传计数，记 0 是正确行为，不是丢数据。`test/smoke-gateway.js` 新增 2 条（断开后仍记 900+100、`error` 帧与截断流都保住 1000），并已验证这两条在旧代码上**失败**、新代码上通过 |
+| **0.2.8** | **修「一个坏请求打挂整个网关」**：`/v1/responses` 在 `try` 里 `return handleResponses(...)` 而没有 `await`，于是 `readBody` 的抛出逃出了外层 `catch`，变成 unhandled rejection —— Node 直接终止进程，**任何一个调用方发一个超大请求体就能让所有持 key 的人一起断线**（11/5 的 `trae-cn-provider.err.log` 里 4 次 `请求体过大` 就是这么来的，launchd 的自动重启把它伪装成「偶发宕机」）。三处一起改：① 改成 `return await`，异常回到正常分支；② `readBody` 不再抛裸 `Error`，超限回 **413 + `request_too_large`**、JSON 坏掉回 **400 + `invalid_json`**，且都**不写 usage 行**（请求根本没发出去，记成 `upstream_error` 会污染报表并误导排错）；③ 请求处理器外层再加一层永不 reject 的兜底，异常回 500 并记日志。超限时仍然把剩余请求体读完再回 413 —— 直接断 socket 会让 `fetch` 报传输错误，看起来像可重试。`test/smoke-responses.js` 新增 2 条（33 MB 请求体 → 413 且进程存活、坏 JSON → 400 且两条路由都覆盖） |
 | **0.2.7** | **让 Codex 桌面版下拉框列出 Trae 模型**：新增 `src/codex-catalog.js`、`GET /v1/models/catalog` 与 `catalog:codex` 子命令。实测确认桌面 App **不读** provider 的 `model_catalog_url`（那条只有 CLI 生效），下拉框只认 `model_catalog_json` 指向的文件，所以改为生成 `~/.codex/models.json`（25 条完整 `ModelInfo`）。两个只有真机才会暴露的坑：① `ModelInfo` 反序列化严格，缺任一字段整条被静默丢弃，下拉框只剩「自定义」；② `instructions_template` 是**替换**整个系统提示词，用短占位会让模型失去自我认知——实测 `glm-5.3-flash` 会顺着上下文自称 DeepSeek，故 `catalog:codex` 从 Codex 自带目录取 21KB 原文，仅改写 `based on GPT-x` 那句身份声明。另新增 `aliases` 配置（`deepseek-flash` → Trae 的 DeepSeek），并修复 `sendError` 缺少 `code`。新增 `test/smoke-codex-catalog.js`（15 条断言） |
 | **0.2.6** | **接 Codex CLI**：新增 `src/responses.js` 与 `POST /v1/responses`（原生 OpenAI Responses API，流式 + 非流式），把 Trae `chat_v3` 的 `text`/`reason`/`tool` 事件翻成 `response.output_item.added|done`、`response.output_text.delta`、`response.reasoning_summary_text.delta`、`response.completed`。Codex CLI 0.166 起 `wire_api = "chat"` 已不可用（加载配置即退出），原先只能靠 LiteLLM 之类做协议翻译；现在直连即可。三处实测踩出来的硬约束：`response.completed.usage` 四个计数必须是整数（否则整轮报 `stream closed before response.completed`）、工具名只能是 `[A-Za-z0-9_-]{1,128}`（否则上游整条请求 4027 失败，故 Codex 的 `multi_agent_v1` 命名空间工具改写成 `multi_agent_v1_spawn` 并在回传时还原）、额度耗尽必须回 429 + `insufficient_quota`（只给 502 会被判可重试并白等 5 次退避）。`sendError` 顺带补上 `code` 字段（以前恒为 `null`，使 404 也看起来可重试）。新增 `test/smoke-responses.js`（22 条断言） |
 | **0.2.5** | **修 Windows 登录「参数异常，请重新登录」**：`openBrowser()` 在 Windows 上走 `cmd /c start "" <url>`，而 Node 不给不含空白的参数加引号，`cmd` 于是在第一个 `&` 处截断，浏览器只打开 `?login_version=1`；企业控制台的 `Le()` 守卫因缺少 `auth_from`/`login_trace_id`/`device_id`/`auth_callback_url` 返回 `missing-params` 并抛出该文案，而插件的回调监听器仍在等。改用 `rundll32 url.dll,FileProtocolHandler`（URL 作为单一 argv，不经 shell）。同时修三处 Windows 平台假设：设备信息与请求头的 `OSInfo`/`x-device-type`/`x-device-brand`/`x-device-cpu`/`x-system-type` 由 `hostPlatform()` 按平台生成（以前写死成 macOS/Apple Silicon/Darwin），`detectEnv()` 补 Windows 安装路径（`%LOCALAPPDATA%\Programs\Trae CN\resources\app` 等）。新增回归测试 2 组（启动命令形态、设备头跟随平台） |

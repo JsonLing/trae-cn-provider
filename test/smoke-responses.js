@@ -576,6 +576,59 @@ await test('the gateway key and daily cap apply to /v1/responses too', async () 
   }
 });
 
+await test('an oversized body answers 413, writes no usage row, and leaves the server running', async () => {
+  // Measured on the live gateway: /v1/responses returned `handleResponses`'s
+  // promise from inside a `try` without awaiting it, so `readBody`'s throw
+  // became an unhandled rejection. Node treats that as fatal — one 33 MB body
+  // from one caller killed the gateway for every caller, and launchd's restart
+  // looked like a random outage.
+  const { openStore } = await load('src/store.js');
+  const store = openStore(':memory:');
+  store.addKey({ key: 'sk-huge-x', label: 'huge-user' });
+  const provider = await makeProvider();
+  const gateway = await startServer(provider, { store });
+  try {
+    const huge = 'x'.repeat(33 * 1024 * 1024);
+    const res = await realFetch(`${gateway.base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer sk-huge-x', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'glm-5.2', input: huge }),
+    });
+    assertEqual(res.status, 413, 'a client error, not the old 502 upstream one');
+    const body = await res.json();
+    assertEqual(body.error.code, 'request_too_large', 'the code is in the body, where Codex reads it');
+    assertEqual(body.error.type, 'invalid_request_error', 'the caller was at fault');
+    assertEqual(store.recent({ limit: 5 }).length, 0, 'no usage row: nothing was sent upstream');
+
+    const health = await realFetch(`${gateway.base}/health`);
+    assertEqual(health.status, 200, 'the process survived what used to be an unhandled rejection');
+  } finally {
+    await gateway.close();
+    store.close();
+  }
+});
+
+await test('a malformed JSON body is a 400 on both routes, never a crash', async () => {
+  const provider = await makeProvider();
+  const server = await startServer(provider, {});
+  try {
+    for (const route of ['/v1/chat/completions', '/v1/responses']) {
+      const res = await realFetch(`${server.base}${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{"model": ',
+      });
+      assertEqual(res.status, 400, `${route} reports a client error`);
+      const body = await res.json();
+      assertEqual(body.error.code, 'invalid_json', `${route} names the problem`);
+    }
+    const health = await realFetch(`${server.base}/health`);
+    assertEqual(health.status, 200, 'still serving after both failures');
+  } finally {
+    await server.close();
+  }
+});
+
 await test('errorCodeOf maps the upstream failure modes Codex cares about', async () => {
   const quota = Object.assign(new Error('Your requests have exceeded the quota'), { code: 4008 });
   assertEqual(errorCodeOf(quota), 'insufficient_quota', 'code 4008 is a spent quota');

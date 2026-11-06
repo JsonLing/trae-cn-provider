@@ -253,17 +253,75 @@ function sendError(res, status, message, type = 'invalid_request_error', code = 
   sendJson(res, status, { error: { message, type, code } });
 }
 
-async function readBody(req, limit = 32 * 1024 * 1024) {
+/** The largest request body the gateway will parse (32 MB). */
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+
+/**
+ * A request body the caller got wrong: too large, or not JSON.
+ *
+ * This exists as its own type because the generic handler used to treat every
+ * failure as an upstream (502) one. It is also *not* an `Error` thrown for the
+ * upstream's benefit: nothing was sent upstream, so it must never be recorded
+ * as a chat attempt or reported as an upstream outage.
+ */
+class BodyError extends Error {
+  /**
+   * @param {string} message
+   * @param {{ status: number, type?: string, code: string }} options
+   */
+  constructor(message, { status, type = 'invalid_request_error', code }) {
+    super(message);
+    this.name = 'BodyError';
+    this.status = status;
+    this.type = type;
+    this.code = code;
+  }
+}
+
+async function readBody(req, limit = MAX_BODY_BYTES) {
   const chunks = [];
   let size = 0;
+  let oversized = false;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > limit) throw new Error('请求体过大');
-    chunks.push(chunk);
+    if (!oversized && size <= limit) {
+      chunks.push(chunk);
+      continue;
+    }
+    // Over the limit: stop buffering, but keep draining so the caller can
+    // actually read the 413 instead of seeing the socket reset mid-upload
+    // (fetch surfaces that as a transport error, which looks retryable).
+    if (!oversized) {
+      oversized = true;
+      chunks.length = 0;
+    }
+    // Draining is a courtesy, not an obligation: past this point the caller is
+    // either broken or hostile, and spending bandwidth on it is not free.
+    if (size > limit * 4) {
+      req.destroy();
+      break;
+    }
+  }
+  if (oversized) {
+    throw new BodyError(`请求体过大（上限 ${limit / 1024 / 1024} MB）`, { status: 413, code: 'request_too_large' });
   }
   const text = Buffer.concat(chunks).toString('utf8');
   if (!text) return {};
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new BodyError('请求体不是合法 JSON', { status: 400, code: 'invalid_json' });
+  }
+}
+
+/** Answer a {@link BodyError} with the status the caller can act on. */
+function sendBodyError(res, err) {
+  if (err.status === 413) {
+    // The upload was drained only so this response could be read; do not let a
+    // client keep pushing a second request down the same connection.
+    res.setHeader('Connection', 'close');
+  }
+  return sendError(res, err.status, err.message, err.type, err.code);
 }
 
 /**
@@ -300,7 +358,12 @@ export function createRequestHandler(
     return typeof alternate === 'string' ? alternate.trim() : '';
   };
 
-  return async function handleRequest(req, res) {
+  /**
+   * The real dispatcher. It may reject (a socket-wide failure, a store that
+   * throws while authenticating); {@link handleRequest} below is the promise
+   * the host actually gets, and that one never does.
+   */
+  async function handle(req, res) {
     const startedAt = now();
     const url = new URL(req.url, 'http://localhost');
     const path = url.pathname;
@@ -555,6 +618,10 @@ export function createRequestHandler(
             model: modelId,
             status: aborted ? STATUS.aborted : STATUS.upstreamError,
             error: aborted ? 'client closed the connection' : err.message,
+            // A call that failed or was cancelled still burned upstream tokens
+            // whenever `token_usage` had already arrived; the chat client
+            // attaches it to the thrown error for exactly this case.
+            usage: err.usage,
             sessionId,
           });
           if (!aborted) {
@@ -565,14 +632,49 @@ export function createRequestHandler(
       }
 
       if (req.method === 'POST' && path === '/v1/responses') {
-        return handleResponses(req, res, { provider, recordUsage, caller, store, now });
+        // `await`, not a bare `return`: a rejection from the Responses handler
+        // used to escape this `try` as an unhandled rejection, which takes the
+        // whole gateway process down for every caller — one bad body from one
+        // colleague stopped the service for all of them.
+        return await handleResponses(req, res, { provider, recordUsage, caller, store, now });
       }
 
       return sendError(res, 404, `未知路径: ${path}`, 'not_found');
     } catch (err) {
-      recordUsage({ status: STATUS.upstreamError, error: err.message });
+      // A malformed body is the caller's mistake, not an upstream failure: no
+      // request left this process, so no usage row is written (there is no
+      // model, session or token count to attribute) and the status says so.
+      if (err instanceof BodyError) {
+        provider.logger?.warn?.(`[trae] 请求体被拒绝（${err.status} ${err.code}）: ${err.message}`);
+        return sendBodyError(res, err);
+      }
+      recordUsage({ status: STATUS.upstreamError, error: err.message, usage: err.usage });
       provider.logger.error?.('[trae] 请求失败:', err.message);
       return sendError(res, 502, err.message, 'upstream_error');
+    }
+  }
+
+  /**
+   * The promise handed to `http.createServer` (and to the DSH host's
+   * `webServer.register`). It must never reject.
+   *
+   * Both mounts call it without a `.catch`: an unhandled rejection is fatal to
+   * the process in current Node, so a single failed request would take the
+   * gateway — and everyone holding a key — down. Whatever slips past the inner
+   * `catch` is answered here as a 500 and logged, never rethrown.
+   */
+  return async function handleRequest(req, res) {
+    try {
+      return await handle(req, res);
+    } catch (err) {
+      provider.logger?.error?.('[trae] 请求处理异常:', err?.message ?? err);
+      try {
+        if (!res.headersSent) return sendError(res, 500, `网关内部错误: ${err?.message ?? err}`, 'server_error', 'internal_error');
+        if (!res.writableEnded) res.end();
+      } catch {
+        /* the socket is already gone; there is nothing left to answer on */
+      }
+      return undefined;
     }
   };
 }
@@ -706,6 +808,11 @@ async function handleResponses(req, res, { provider, recordUsage, caller, store,
         model: modelId,
         status: aborted ? STATUS.aborted : STATUS.upstreamError,
         error: aborted ? 'client closed the connection' : err.message,
+        // Same reason as the chat-completions path: `token_usage` precedes
+        // `done`, so a cancelled or failed turn may still have been billed.
+        // The frame seen by `onEvent` is preferred, and the client's copy on the
+        // error is the fallback for an abort that killed the read first.
+        usage: usage ?? err.usage,
         sessionId,
       });
       if (aborted || res.writableEnded) return undefined;
@@ -722,7 +829,9 @@ async function handleResponses(req, res, { provider, recordUsage, caller, store,
   } catch (err) {
     // Reached only when the failure happens before the stream opened (model
     // catalog, body parse, first upstream call). Report it as a real HTTP error.
-    recordUsage({ model: modelId, status: STATUS.upstreamError, error: err.message, sessionId });
+    // `err.usage` is set when the upstream had already published `token_usage`
+    // before failing, which is the non-streaming branch's usual shape.
+    recordUsage({ model: modelId, status: STATUS.upstreamError, error: err.message, usage: err.usage, sessionId });
     if (opened && !res.writableEnded) {
       emit(emitter.failed({ code: errorCodeOf(err), message: err.message }));
       res.end();

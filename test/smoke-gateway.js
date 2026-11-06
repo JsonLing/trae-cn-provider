@@ -584,9 +584,112 @@ await test('a client hanging up mid-stream is recorded as aborted', async () => 
   }
 });
 
-// ---------------------------------------------------------------- admin
-await test('the admin page renders real numbers server-side', async () => {
+await test('an aborted call keeps the tokens the upstream had already reported', async () => {
+  // The upstream publishes `token_usage` *before* `done`. A client that hangs
+  // up in between has still been charged, so the row must not read 0 — that is
+  // what made the ledger under-count, and aborts are the expensive rows.
   const store = openStore(':memory:');
+  store.addKey({ key: 'sk-iris-x', label: 'iris' });
+  const provider = await makeProvider();
+  const gateway = await startGateway(provider, store);
+  const mock = mockFetch(
+    (_url, init) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            controller.enqueue(encoder.encode(sse('output', { content: 'partial' })));
+            // Arrives before the hang-up, exactly like the real stream.
+            setTimeout(() => {
+              try {
+                controller.enqueue(
+                  encoder.encode(sse('token_usage', { prompt_tokens: 900, completion_tokens: 100, total_tokens: 1000 })),
+                );
+              } catch {
+                /* the client already left */
+              }
+            }, 20);
+            init?.signal?.addEventListener('abort', () => {
+              try {
+                controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+              } catch {
+                /* already errored */
+              }
+            });
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+  );
+  try {
+    const abort = new AbortController();
+    const res = await realFetch(`${gateway.base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer sk-iris-x', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'glm-5.2', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      signal: abort.signal,
+    });
+    const reader = res.body.getReader();
+    await reader.read();
+    // Let the token_usage frame reach the handler before disconnecting.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    abort.abort();
+    await reader.cancel().catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const [row] = store.recent({ limit: 1 });
+    assertEqual(row.status, STATUS.aborted, 'still labelled aborted');
+    assertEqual(row.prompt_tokens, 900, 'the prompt tokens the upstream charged are kept');
+    assertEqual(row.completion_tokens, 100, 'so are the completion tokens');
+    assertEqual(row.total_tokens, 1000, 'and the row is no longer silently 0');
+  } finally {
+    mock.restore();
+    await gateway.close();
+    store.close();
+  }
+});
+
+await test('a stream that dies after token_usage still bills its tokens', async () => {
+  // Two shapes reach the same gap: an explicit `error` frame, and a stream that
+  // simply ends without `done`. Both used to throw away the usage they had.
+  for (const [label, frames] of [
+    [
+      'error frame',
+      sse('output', { content: 'partial' }) +
+        sse('token_usage', { prompt_tokens: 900, completion_tokens: 100, total_tokens: 1000 }) +
+        sse('error', { code: 4222, message: '上游返回错误' }),
+    ],
+    [
+      'truncated stream',
+      sse('output', { content: 'partial' }) +
+        sse('token_usage', { prompt_tokens: 900, completion_tokens: 100, total_tokens: 1000 }),
+    ],
+  ]) {
+    const store = openStore(':memory:');
+    store.addKey({ key: 'sk-jude-x', label: 'jude' });
+    const provider = await makeProvider();
+    const gateway = await startGateway(provider, store);
+    const mock = mockFetch(() => sseResponse(frames));
+    try {
+      const res = await realFetch(`${gateway.base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer sk-jude-x', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'glm-5.2', stream: false, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      await res.text();
+      const [row] = store.recent({ limit: 1 });
+      assertEqual(row.status, STATUS.upstreamError, `${label}: still an upstream error`);
+      assertEqual(row.total_tokens, 1000, `${label}: the billed tokens survive the failure`);
+    } finally {
+      mock.restore();
+      await gateway.close();
+      store.close();
+    }
+  }
+});
+
+// ---------------------------------------------------------------- admin
+await test('the admin page renders real numbers server-side', async () => {  const store = openStore(':memory:');
   const { id } = store.addKey({ key: 'sk-olga-x', label: 'olga', limitTokensPerDay: 1000, note: '设计部' });
   store.record({ keyId: id, keyLabel: 'olga', totalTokens: 123, status: STATUS.ok });
   const provider = await makeProvider();

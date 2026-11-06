@@ -552,6 +552,22 @@ export async function chat({ creds, env, body, signal, headers, onEvent = () => 
     }
   };
 
+  /**
+   * Attach whatever `token_usage` already arrived to a thrown failure.
+   *
+   * A failed or cancelled call is not necessarily a free one. The upstream
+   * emits `token_usage` *before* `done`, so an error frame, a truncated stream
+   * or a client hang-up can all arrive after the tokens were already counted
+   * against the account. Dropping `usage` here made exactly those requests
+   * invisible in the gateway's ledger — the aborts and the upstream failures
+   * are the expensive ones, and they were the only rows recorded as 0 tokens.
+   * The caller decides what to do with it; this only refuses to discard it.
+   */
+  const withUsage = (error) => {
+    if (usage) error.usage = usage;
+    return error;
+  };
+
   try {
     for await (const line of sseLines(res)) {
       if (line === '') {
@@ -568,7 +584,10 @@ export async function chat({ creds, env, body, signal, headers, onEvent = () => 
     }
     dispatch();
   } catch (err) {
-    if (err.name === 'AbortError') throw err;
+    // An abort is the caller's own signal, so it keeps its identity (the
+    // gateway distinguishes `aborted` from `upstream_error` by it) — but it
+    // still carries the tokens the upstream already charged for.
+    if (err.name === 'AbortError') throw withUsage(err);
     failure = failure || { code: -1, message: `读取上游流失败: ${err.message}` };
   }
 
@@ -578,12 +597,12 @@ export async function chat({ creds, env, body, signal, headers, onEvent = () => 
     if (remainUsage) error.remainUsage = remainUsage;
     if (creditsRemain) error.creditsRemain = creditsRemain;
     if (billingMode) error.billingMode = billingMode;
-    throw error;
+    throw withUsage(error);
   }
   if (!sawDone) {
     const error = new Error('上游提前关闭流，未收到结束事件');
     error.code = -1;
-    throw error;
+    throw withUsage(error);
   }
   return { finishReason: finishReason || 'stop', usage };
 }
