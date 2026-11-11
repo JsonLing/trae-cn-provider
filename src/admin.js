@@ -26,6 +26,9 @@ const REALM = 'trae-cn gateway admin';
  */
 const GATEWAY_LABEL = 'OpenAI 兼容端点';
 
+/** Human text for the three key states rendered as a pill. */
+const STATE_TEXT = { on: '启用', off: '已停用', capped: '已触顶' };
+
 /**
  * What an operator pastes into a chat message when handing a key over.
  *
@@ -248,13 +251,24 @@ export function createAdminHandler({ store, quota = () => null, password = null 
     if (req.method === 'GET' && path === '/admin/api/overview') {
       const window = resolveWindow(url);
       const { since, until } = window.range;
+      const keys = store.listKeys();
+      const report = store.report({ since, until });
+      const byModel = store.byModel({ since, until });
       sendJson(res, 200, {
         window,
-        keys: store.listKeys(),
-        report: store.report({ since, until }),
-        byModel: store.byModel({ since, until }),
+        keys,
+        report,
+        byModel,
         daily: store.daily({ since, until }),
         quota: quota() ?? store.latestQuota(),
+        // Pre-rendered panels, so the browser never re-implements the table
+        // markup (and never silently forgets a column when one is added). The
+        // copy payload depends on the viewer's `Host`, which only the server
+        // sees, so this cannot be built client-side at all.
+        html: {
+          keys: renderKeysPanel({ keys, report, hostHeader: String(req.headers.host || '') }),
+          models: renderModelsPanel(byModel),
+        },
       });
       return true;
     }
@@ -321,19 +335,9 @@ export function createAdminHandler({ store, quota = () => null, password = null 
   };
 }
 
-/**
- * Render the whole page.
- *
- * Server-rendered on purpose: the first paint contains the real numbers, so an
- * operator opening the page while `serve` is busy still sees today's usage
- * without waiting on a fetch round-trip.
- */
-function renderPage({ store, quota, password = null, hostHeader = '' }) {
-  const keys = store.listKeys();
-  const today = store.report();
-  const byModel = store.byModel();
-  const balance = quota() ?? store.latestQuota();
-  const totals = today.reduce(
+/** Roll the per-key report rows up into the five header cards. */
+function sumTotals(report) {
+  return report.reduce(
     (acc, row) => ({
       requests: acc.requests + row.requests,
       tokens: acc.tokens + row.totalTokens,
@@ -343,9 +347,26 @@ function renderPage({ store, quota, password = null, hostHeader = '' }) {
     }),
     { requests: 0, tokens: 0, aborted: 0, errors: 0, denied: 0 },
   );
-  const usageById = new Map(today.map((row) => [row.label, row]));
+}
 
-  const keyRows = keys
+/**
+ * Inner HTML of the "Key 与用量" panel for one window.
+ *
+ * Extracted from {@link renderPage} because the page needs it twice: once at
+ * first paint (server-rendered, so the numbers are real before any fetch) and
+ * again on every range change. The browser cannot re-derive it — the usage
+ * numbers come from the report, not from the key rows — so it is served over
+ * `/admin/api/overview` as ready-made markup. Rendering it in one place is what
+ * keeps the two paths from drifting apart; a second implementation in the page
+ * script is exactly how the table kept showing today's numbers for a week-long
+ * range.
+ *
+ * @param {{ keys: object[], report: object[], hostHeader?: string }} input
+ */
+function renderKeysPanel({ keys, report, hostHeader = '' }) {
+  if (!keys.length) return '<div class="empty">还没有 key。先在上方创建一把，再发给同事。</div>';
+  const usageById = new Map(report.map((row) => [row.label, row]));
+  const rows = keys
     .map((key) => {
       const used = usageById.get(key.label) ?? {};
       const spent = Number(used.totalTokens ?? 0);
@@ -374,7 +395,7 @@ function renderPage({ store, quota, password = null, hostHeader = '' }) {
               : ''
           }
         </td>
-        <td><span class="pill ${state}">${state === 'on' ? '启用' : state === 'off' ? '已停用' : '已触顶'}</span></td>
+        <td><span class="pill ${state}">${STATE_TEXT[state]}</span></td>
         <td class="num">
           <div>${humanTokens(spent)}</div>
           <div class="bar"><i style="width:${pct}%"></i></div>
@@ -391,13 +412,39 @@ function renderPage({ store, quota, password = null, hostHeader = '' }) {
       </tr>`;
     })
     .join('');
+  return `<table>
+<thead><tr>
+  <th>label</th><th>key（点击复制：地址 + key）</th><th>状态</th>
+  <th class="num">tokens</th><th class="num">请求</th><th class="num">异常</th><th>最近调用</th><th>操作</th>
+</tr></thead>
+<tbody>${rows}</tbody></table>`;
+}
 
-  const modelRows = byModel
+/** Inner HTML of the "按模型" panel; same two call sites as {@link renderKeysPanel}. */
+function renderModelsPanel(byModel) {
+  if (!byModel.length) return '<div class="empty">该时间范围内没有调用。</div>';
+  const rows = byModel
     .map(
       (row) =>
         `<tr><td>${escapeHtml(row.model)}</td><td class="num">${row.requests}</td><td class="num">${humanTokens(row.totalTokens)}</td></tr>`,
     )
     .join('');
+  return `<table><thead><tr><th>模型</th><th class="num">请求</th><th class="num">tokens</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/**
+ * Render the whole page.
+ *
+ * Server-rendered on purpose: the first paint contains the real numbers, so an
+ * operator opening the page while `serve` is busy still sees today's usage
+ * without waiting on a fetch round-trip.
+ */
+function renderPage({ store, quota, password = null, hostHeader = '' }) {
+  const keys = store.listKeys();
+  const today = store.report();
+  const byModel = store.byModel();
+  const balance = quota() ?? store.latestQuota();
+  const totals = sumTotals(today);
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -571,9 +618,9 @@ function renderPage({ store, quota, password = null, hostHeader = '' }) {
     <div class="stat"><div class="v" data-stat="requests">${totals.requests}</div><div class="k">请求（所选区间）</div></div>
     <div class="stat"><div class="v" data-stat="tokens">${humanTokens(totals.tokens)}</div><div class="k">tokens（所选区间）</div></div>
     <div class="stat"><div class="v">${keys.filter((k) => k.enabled).length}/${keys.length}</div><div class="k">启用 / 全部 key</div></div>
-    <div class="stat"><div class="v">${totals.aborted}</div><div class="k">中断（已记账）</div></div>
-    <div class="stat ${totals.denied > 0 ? 'bad' : ''}"><div class="v">${totals.denied}</div><div class="k">被拒（401/403/429）</div></div>
-    ${balance ? `<div class="stat"><div class="v">${balance.remaining}</div><div class="k">上游余额${balance.billing_mode ? ` · ${escapeHtml(balance.billing_mode)}` : ''}</div></div>` : ''}
+    <div class="stat"><div class="v" data-stat="aborted">${totals.aborted}</div><div class="k">中断（已记账）</div></div>
+    <div class="stat ${totals.denied > 0 ? 'bad' : ''}" data-stat-card="denied"><div class="v" data-stat="denied">${totals.denied}</div><div class="k">被拒（401/403/429）</div></div>
+    ${balance ? `<div class="stat"><div class="v" data-stat="balance">${balance.remaining}</div><div class="k">上游余额${balance.billing_mode ? ` · ${escapeHtml(balance.billing_mode)}` : ''}</div></div>` : ''}
   </div>
 
   ${passwordlessWarning(password)}
@@ -609,26 +656,13 @@ function renderPage({ store, quota, password = null, hostHeader = '' }) {
   </div>
 
   <h2>Key 与用量</h2>
-  <div class="panel">
-    ${
-      keys.length
-        ? `<table>
-<thead><tr>
-  <th>label</th><th>key（点击复制：地址 + key）</th><th>状态</th>
-  <th class="num">tokens</th><th class="num">请求</th><th class="num">异常</th><th>最近调用</th><th>操作</th>
-</tr></thead>
-<tbody>${keyRows}</tbody></table>`
-        : '<div class="empty">还没有 key。先在上方创建一把，再发给同事。</div>'
-    }
+  <div class="panel" id="keys-panel">
+    ${renderKeysPanel({ keys, report: today, hostHeader })}
   </div>
 
   <h2>按模型</h2>
-  <div class="panel">
-    ${
-      byModel.length
-        ? `<table><thead><tr><th>模型</th><th class="num">请求</th><th class="num">tokens</th></tr></thead><tbody>${modelRows}</tbody></table>`
-        : '<div class="empty">该时间范围内没有调用。</div>'
-    }
+  <div class="panel" id="models-panel">
+    ${renderModelsPanel(byModel)}
   </div>
 
   <h2>最近请求</h2>
@@ -703,7 +737,10 @@ document.getElementById('create').addEventListener('submit', async (event) => {
       (copied ? '已复制到剪贴板。' : '请手动复制上面的 key。') + '\\n页面即将刷新…');
     event.target.reset();
     setTimeout(() => {
-      location.hash = 'created=' + encodeURIComponent(created.label);
+      // Carry the window across the reload. Replacing the hash outright would
+      // drop a range the operator had picked, silently snapping the page back to
+      // "today" right after they created a key.
+      location.hash = hashOf({ w: currentQuery(), created: created.label });
       location.reload();
     }, 550);
   } catch (err) { show('创建失败：' + err.message); }
@@ -735,19 +772,25 @@ document.addEventListener('click', async (event) => {
   const button = event.target.closest('button[data-act]');
   if (!button) return;
   const id = button.closest('tr').dataset.key;
+  // Every one of these ends in a reload; keep the window the operator is looking
+  // at instead of snapping back to the server-rendered default of "today".
+  const reload = () => {
+    location.hash = hashOf({ w: currentQuery() });
+    location.reload();
+  };
   try {
     if (button.dataset.act === 'toggle') {
       await api('POST', '/admin/api/keys/' + id + '/toggle', { enabled: button.dataset.enabled === '1' });
-      location.reload();
+      reload();
     } else if (button.dataset.act === 'limit') {
       const raw = prompt('每日 token 上限（留空表示不限额）：', '200000');
       if (raw === null) return;
       await api('POST', '/admin/api/keys/' + id + '/limit', { limitTokensPerDay: raw.trim() === '' ? null : Number(raw) });
-      location.reload();
+      reload();
     } else if (button.dataset.act === 'delete') {
       if (!confirm('删除后该 key 立即失效，历史用量仍保留在报告里。继续？')) return;
       await api('DELETE', '/admin/api/keys/' + id);
-      location.reload();
+      reload();
     }
   } catch (err) { show('操作失败：' + err.message); }
 });
@@ -783,14 +826,66 @@ async function loadRange(query) {
     fromEl.value = w.from;
     toEl.value = w.to;
     rangeLabel.textContent = w.from === w.to ? w.from : w.from + ' ~ ' + w.to;
-    const sum = data.report.reduce((a, r) => a + r.totalTokens, 0);
-    const reqs = data.report.reduce((a, r) => a + r.requests, 0);
-    document.querySelector('[data-stat="requests"]').textContent = reqs;
-    document.querySelector('[data-stat="tokens"]').textContent =
-      sum >= 1e6 ? (sum / 1e6).toFixed(1) + 'M' : sum >= 1e3 ? (sum / 1e3).toFixed(1) + 'k' : String(sum);
-    location.hash = 'w=' + query;
+
+    // Everything below the date picker is scoped to the window, so every one of
+    // them has to be repainted — not just the two headline cards. The key and
+    // model tables are server-rendered markup, replaced wholesale.
+    const totals = data.report.reduce((acc, row) => ({
+      requests: acc.requests + row.requests,
+      tokens: acc.tokens + row.totalTokens,
+      aborted: acc.aborted + row.abortedRequests,
+      denied: acc.denied + row.quotaDenied + row.unauthorized + row.disabledDenied,
+    }), { requests: 0, tokens: 0, aborted: 0, denied: 0 });
+
+    setStat('requests', totals.requests);
+    setStat('tokens', fmtTokens(totals.tokens));
+    setStat('aborted', totals.aborted);
+    setStat('denied', totals.denied);
+    document.querySelector('[data-stat-card="denied"]').classList.toggle('bad', totals.denied > 0);
+
+    document.getElementById('keys-panel').innerHTML = data.html.keys;
+    document.getElementById('models-panel').innerHTML = data.html.models;
+
+    // Keep the balance card in step too: \`notify_usage\` snapshots arrive during
+    // requests, so a stale figure here is the one number an operator would act on.
+    if (data.quota) setStat('balance', String(data.quota.remaining ?? '—'));
+
+    // Encoded as one value: a raw \`from=…&to=…\` would be split on \`&\` when read
+    // back, silently dropping \`to\` and collapsing the range to its first day.
+    location.hash = hashOf({ w: query });
+    current = query;
     await loadRequests(query);
   } catch (err) { show('加载失败：' + err.message); }
+}
+
+function setStat(name, value) {
+  const el = document.querySelector('[data-stat="' + name + '"]');
+  if (el) el.textContent = value;
+}
+
+/** Same compact form the server uses for \`humanTokens\`. */
+function fmtTokens(value) {
+  const n = Number(value) || 0;
+  return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+}
+
+// The window currently on screen, so a reload can carry it along instead of
+// falling back to the server-rendered default of "today".
+let current = 'days=1';
+const currentQuery = () => current;
+
+/** \`{ w: 'from=…&to=…', created: 'alice' }\` → a hash both boot paths understand. */
+function hashOf({ w, created }) {
+  const parts = [];
+  if (w) parts.push('w=' + encodeURIComponent(w));
+  if (created) parts.push('created=' + encodeURIComponent(created));
+  return parts.join('&');
+}
+
+/** Pull one \`key=value\` out of the hash, whatever order the parts are in. */
+function hashPart(hash, name) {
+  const match = new RegExp('(?:^#?|&)' + name + '=([^&]*)').exec(hash);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
 for (const b of document.querySelectorAll('#presets button')) {
@@ -828,25 +923,30 @@ async function loadRequests(query) {
   }
 }
 
-// Initial paint: honour a window carried in the hash after a reload.
-(function boot() {
-  const match = location.hash.match(/^#w=(.+)$/);
-  if (match) {
-    const query = decodeURIComponent(match[1]);
-    const days = /days=(\\d+)/.exec(query);
-    if (days) setPressed(Number(days[1]));
-    loadRange(query);
-    return;
-  }
-  rangeLabel.textContent = isoDay(today);
-  loadRequests('days=1');
+// Initial paint: honour a window carried in the hash after a reload, then flash
+// a freshly created row. Both live in one boot path because the key table is
+// repainted from the overview response — flashing before that resolves would
+// mark a row that is about to be replaced.
+(async function boot() {
+  const carried = hashPart(location.hash, 'w');
+  const created = hashPart(location.hash, 'created');
+  const query = carried || 'days=1';
+
+  const days = /days=(\\d+)/.exec(query);
+  if (days) setPressed(Number(days[1]));
+  if (!carried) rangeLabel.textContent = isoDay(today);
+
+  await loadRange(query);
+  if (created) highlightRow(created);
+
+  // Drop the \`created\` marker once consumed, but keep the window: a manual
+  // refresh must land on the same range, and a leftover \`#created=\` would flash
+  // the same row on every reload. \`loadRange\` has already written \`#w=…\`, so in
+  // the common case this rewrite changes nothing.
+  history.replaceState(null, '', location.pathname + '#w=' + encodeURIComponent(query));
 })();
 
-// After a create-triggered reload, scroll to and flash the new row.
-(function highlightCreated() {
-  const match = location.hash.match(/^#created=(.+)$/);
-  if (!match) return;
-  const label = decodeURIComponent(match[1]);
+function highlightRow(label) {
   for (const row of document.querySelectorAll('tbody tr[data-key]')) {
     if (row.dataset.label === label) {
       row.classList.add('flash');
@@ -855,8 +955,7 @@ async function loadRequests(query) {
       break;
     }
   }
-  history.replaceState(null, '', location.pathname);
-})();
+}
 </script>
 </body>
 </html>`;

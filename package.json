@@ -1,6 +1,6 @@
 {
   "name": "trae-cn-provider",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "private": false,
   "type": "module",
   "description": "Trae CN as a native DeepSeek Harness LLM provider: browser OAuth login by default, optional local-install credential source, OpenAI-compatible surface (chat completions + Responses API for Codex CLI) on the host web server",

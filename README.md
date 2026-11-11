@@ -417,12 +417,18 @@ unknown              2           0      0%       0         0       2
 
 - **统计卡片**：请求数、tokens、启用 key 数、中断次数、被拒次数、上游余额
 - **时间范围**：今日 / 近 7 天 / 近 30 天三个快捷档，外加 `from`–`to` 两个日期选择器；
-  数据为空的日子在按日序列里补 0 而不是跳过，所以安静的一天不会被压成看不见的缝隙
-- **key 与用量**：每行显示明文 key、状态、带进度条的 tokens/上限、请求数、异常数、最近调用
+  数据为空的日子在按日序列里补 0 而不是跳过，所以安静的一天不会被压成看不见的缝隙。
+  **切换区间时下面每一块都跟着换**——key 与用量表、按模型表、全部统计卡片、最近请求，
+  不只是头两张卡片；区间会写进 URL 的 `#w=…`，刷新页面仍停在同一个区间
+- **key 与用量**：每行显示明文 key、状态、带进度条的 tokens/上限、请求数、异常数、最近调用；
+  这里的 tokens 与上限进度**都是所选区间内的**，所以同一个 key 换到更长的区间会显示更多用量、
+  甚至从「启用」变成「已触顶」——上限本身仍是按自然日计的
 - **一键复制**：每行的「复制」给的是**网关地址 + key + 默认模型**的完整小段，可直接粘给同事；
   **地址按你访问页面时用的 Host 自动取**——从 `127.0.0.1` 打开就复制 `127.0.0.1`，
   从内网 IP 打开就复制内网 IP，不会把只有本机可用的地址发给别人。表头另有「复制全部 key」
-- 支持新建 key、改上限、停用、删除；渲染在服务端完成，**没有前端构建步骤**
+- 支持新建 key、改上限、停用、删除；渲染在服务端完成，**没有前端构建步骤**。
+  表格 HTML 由服务端生成并随 `/admin/api/overview` 一起下发，浏览器只负责替换——
+  复制小段里要嵌访问者的 `Host`，这件事只有服务端做得到
 
 管理页的鉴权是**独立**的：拿到 `/v1` key 的人打不开它。否则同事既能改自己的上限，也能看到所有人的用量。
 
@@ -1091,6 +1097,7 @@ launchctl bootout gui/$(id -u)/local.trae-cn-provider
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.10** | **修「切了时间范围，key 与用量不跟着变」**：管理页的「Key 与用量」「按模型」两张表只在首屏服务端渲染一次，之后没有任何客户端代码碰过它们 —— `loadRange()` 只回写「请求 / tokens」两张卡片和「最近请求」，于是选了更长的区间，头两张卡片变了、下面每个 key 的 tokens 却仍停在「今日」。`src/admin.js` 把两张表抽成 `renderKeysPanel()` / `renderModelsPanel()`，由 `/admin/api/overview` 连同数据一起下发**已渲染好的 HTML**（复制小段要嵌访问者的 `Host`，浏览器端根本拼不出来），`loadRange()` 整体替换 `#keys-panel` / `#models-panel`，并补上「中断」「被拒」「上游余额」三张卡片与 `bad` 样式、状态胶囊与进度条。同一处还修了两个连带 bug：① 新建 key / 改上限 / 停用后 `location.reload()` 会把 hash 覆写成 `#created=…`，刚选的区间直接丢失 —— 现在 `hashOf()` 把 `w` 与 `created` 一起编码，boot 路径用 `hashPart()` 分别读取；② 区间原先以 `w=from=…&to=…` 原样写进 hash，`&` 被当成分隔符，刷新后 `to` 消失、30 天区间塌成一天。`test/smoke-gateway.js` 新增 4 条（区间变化必须产出不同的表格 HTML、胶囊/进度条随区间同步、刷新保留区间、抽出内联脚本用 `node:vm` 编译并往返验证 hash 编码），已验证这 4 条在旧代码上**全部失败**、新代码上通过；另用真实 Chromium 跑了一遍 2026-10-12 → 2026-11-10 的切换与刷新 |
 | **0.2.9** | **修「token 统计少算」——中断与失败请求的 token 被整段丢掉**：上游的 `token_usage` 帧在正文之后、`done` **之前**下发，而 `chat()` 只在正常返回时带出 `usage`；一旦中途抛错（客户端断开、上游 `error` 帧、流被截断），已经收到的 `token_usage` 就随异常一起被丢弃，网关只能记一行 `total_tokens = 0`。实测复现：客户端在上游回 `token_usage` 后断开，上游已按 1500 tokens 计费，账本记 0。**这不是边角情况**：正文流完后用户点「停止」、Codex 取消、或上游在最后一帧报错，都会命中 —— 那正是最贵的几类行（`aborted` / `upstream_error`），报表因此系统性偏小，日上限也压不住真正的大户。修法：`src/trae-client.js` 新增 `withUsage()`，把已收到的 `usage` 挂到抛出的错误上（`AbortError` 也保留 —— 网关靠它区分 `aborted` 与 `upstream_error`），三处记录点（chat 流式 / responses 流式 / responses 外层）改为从 `err.usage` 取。**注意边界**：若在 `token_usage` 到达**之前**就断开，上游确实还没回传计数，记 0 是正确行为，不是丢数据。`test/smoke-gateway.js` 新增 2 条（断开后仍记 900+100、`error` 帧与截断流都保住 1000），并已验证这两条在旧代码上**失败**、新代码上通过 |
 | **0.2.8** | **修「一个坏请求打挂整个网关」**：`/v1/responses` 在 `try` 里 `return handleResponses(...)` 而没有 `await`，于是 `readBody` 的抛出逃出了外层 `catch`，变成 unhandled rejection —— Node 直接终止进程，**任何一个调用方发一个超大请求体就能让所有持 key 的人一起断线**（11/5 的 `trae-cn-provider.err.log` 里 4 次 `请求体过大` 就是这么来的，launchd 的自动重启把它伪装成「偶发宕机」）。三处一起改：① 改成 `return await`，异常回到正常分支；② `readBody` 不再抛裸 `Error`，超限回 **413 + `request_too_large`**、JSON 坏掉回 **400 + `invalid_json`**，且都**不写 usage 行**（请求根本没发出去，记成 `upstream_error` 会污染报表并误导排错）；③ 请求处理器外层再加一层永不 reject 的兜底，异常回 500 并记日志。超限时仍然把剩余请求体读完再回 413 —— 直接断 socket 会让 `fetch` 报传输错误，看起来像可重试。`test/smoke-responses.js` 新增 2 条（33 MB 请求体 → 413 且进程存活、坏 JSON → 400 且两条路由都覆盖） |
 | **0.2.7** | **让 Codex 桌面版下拉框列出 Trae 模型**：新增 `src/codex-catalog.js`、`GET /v1/models/catalog` 与 `catalog:codex` 子命令。实测确认桌面 App **不读** provider 的 `model_catalog_url`（那条只有 CLI 生效），下拉框只认 `model_catalog_json` 指向的文件，所以改为生成 `~/.codex/models.json`（25 条完整 `ModelInfo`）。两个只有真机才会暴露的坑：① `ModelInfo` 反序列化严格，缺任一字段整条被静默丢弃，下拉框只剩「自定义」；② `instructions_template` 是**替换**整个系统提示词，用短占位会让模型失去自我认知——实测 `glm-5.3-flash` 会顺着上下文自称 DeepSeek，故 `catalog:codex` 从 Codex 自带目录取 21KB 原文，仅改写 `based on GPT-x` 那句身份声明。另新增 `aliases` 配置（`deepseek-flash` → Trae 的 DeepSeek），并修复 `sendError` 缺少 `code`。新增 `test/smoke-codex-catalog.js`（15 条断言） |

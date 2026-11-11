@@ -11,6 +11,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import vm from 'node:vm';
 import { assert, assertEqual, mockFetch, sse, sseResponse, test } from './support.js';
 import { installShims, load } from './support.js';
 
@@ -850,6 +851,140 @@ await test('the admin page reports a window, and the date picker can narrow it',
     // Requests are filtered by the same window.
     const recent = await realFetch(`${gateway.base}/admin/api/requests?limit=50&from=${day(7)}&to=${day(0)}`).then((r) => r.json());
     assertEqual(recent.requests.length, 2, 'both requests inside the range');
+  } finally {
+    await gateway.close();
+    store.close();
+  }
+});
+
+await test('changing the window repaints the key and model tables, not just the cards', async () => {
+  // Regression: the key/model tables were rendered once, server-side, and no
+  // client code ever touched them. Picking a wider range updated the two
+  // headline cards while the per-key numbers stayed frozen at "today" — the
+  // exact symptom of "切了时间但 key 与用量没跟着刷新".
+  const store = openStore(':memory:');
+  const { id } = store.addKey({ key: 'sk-vera-x', label: 'vera', limitTokensPerDay: 1000 });
+  const today = startOfToday();
+  // 40 tokens today, 507 a week ago: the two windows must disagree visibly.
+  store.record({ keyId: id, keyLabel: 'vera', totalTokens: 40, status: STATUS.ok, ts: today + 60 });
+  store.record({ keyId: id, keyLabel: 'vera', totalTokens: 500, status: STATUS.ok, ts: today - 6 * 86400 + 60 });
+  store.record({ keyId: id, keyLabel: 'vera', totalTokens: 7, status: STATUS.aborted, ts: today - 6 * 86400 + 120 });
+  const provider = await makeProvider();
+  const gateway = await startGateway(provider, store);
+  try {
+    const todayOnly = await realFetch(`${gateway.base}/admin/api/overview`).then((r) => r.json());
+    const week = await realFetch(`${gateway.base}/admin/api/overview?days=7`).then((r) => r.json());
+
+    // The response carries ready-made markup for both panels. Without it the
+    // browser cannot rebuild the table at all: the copy payload embeds the
+    // request's Host, which only the server sees.
+    assert(typeof week.html?.keys === 'string' && week.html.keys.includes('<table'), 'the overview ships the key table markup');
+    assert(typeof week.html?.models === 'string' && week.html.models.includes('<table'), 'and the model table markup');
+
+    // The markup must differ between windows. A table that renders identical
+    // HTML for a day and for a week is a table that is not scoped to the window.
+    assert(week.html.keys !== todayOnly.html.keys, 'a week-wide key table differs from a one-day one');
+    assert(week.html.models !== todayOnly.html.models, 'same for the model table');
+
+    // And it must carry the numbers for the window it was asked for.
+    assert(todayOnly.html.keys.includes('40'), "today's table shows today's 40 tokens");
+    assert(!todayOnly.html.keys.includes('547'), "and not the week's total");
+    assert(week.html.keys.includes('547'), 'the week table shows 40 + 500 + 7 = 547 tokens');
+    assert(week.html.models.includes('547'), 'and so does the model table');
+  } finally {
+    await gateway.close();
+    store.close();
+  }
+});
+
+await test('the repainted key table keeps its pills and bars in step with the window', async () => {
+  // A row that looks healthy on a narrow range must look capped on a range that
+  // includes the spend; otherwise the pill contradicts the number beside it.
+  const store = openStore(':memory:');
+  const { id } = store.addKey({ key: 'sk-wes-x', label: 'wes', limitTokensPerDay: 100 });
+  const today = startOfToday();
+  store.record({ keyId: id, keyLabel: 'wes', totalTokens: 150, status: STATUS.ok, ts: today - 2 * 86400 + 60 });
+  const provider = await makeProvider();
+  const gateway = await startGateway(provider, store);
+  try {
+    const narrow = await realFetch(`${gateway.base}/admin/api/overview`).then((r) => r.json());
+    const wide = await realFetch(`${gateway.base}/admin/api/overview?days=7`).then((r) => r.json());
+    assert(narrow.html.keys.includes('pill on'), 'spending nothing today, the key looks healthy');
+    assert(wide.html.keys.includes('pill capped'), 'over a range that includes the spend, it is capped');
+    assert(wide.html.keys.includes('width:100%'), 'and its bar is full');
+    assert(wide.html.keys.includes('150'), 'the cap is measured against the windowed total');
+  } finally {
+    await gateway.close();
+    store.close();
+  }
+});
+
+await test('a reload after creating a key keeps the selected window', async () => {
+  // Regression: the create handler overwrote the hash with `#created=…`, so the
+  // reload dropped `#w=…` and the page fell back to "today" — the operator's
+  // range vanished right after they created a key. The hash now carries both
+  // parts and the boot path reads them independently.
+  const store = openStore(':memory:');
+  const provider = await makeProvider();
+  const gateway = await startGateway(provider, store);
+  try {
+    const html = await realFetch(`${gateway.base}/admin`).then((r) => r.text());
+    assert(html.includes('hashOf({ w: currentQuery(), created: created.label })'), 'create carries the window forward');
+    assert(html.includes('hashOf({ w: currentQuery() })'), 'row actions do too');
+    assert(!/location\.hash = 'created='/.test(html), 'and nothing overwrites the window any more');
+    assert(html.includes("hashPart(location.hash, 'w')"), 'boot reads the window part');
+    assert(html.includes("hashPart(location.hash, 'created')"), 'and the created part');
+    assert(html.includes('current = query;'), 'the active window is remembered');
+  } finally {
+    await gateway.close();
+    store.close();
+  }
+});
+
+await test('the page script is valid JavaScript, and encodes its window into the hash', async () => {
+  // The page is one big template literal, so `node --check` on admin.js never
+  // looks inside <script>: a syntax error there ships silently and breaks every
+  // button on the page. Compiling the extracted script catches it, and the
+  // round-trip check catches the other half of the same bug — a window written
+  // into the hash as `w=from=…&to=…` is split on `&` when read back, so `to`
+  // disappears and a 30-day range collapses to one day on the next refresh.
+  const store = openStore(':memory:');
+  const provider = await makeProvider();
+  const gateway = await startGateway(provider, store);
+  try {
+    const html = await realFetch(`${gateway.base}/admin`).then((r) => r.text());
+    const open = html.indexOf('<script>');
+    const close = html.lastIndexOf('</script>');
+    assert(open > 0 && close > open, 'the page carries exactly one inline script');
+    const script = html.slice(open + '<script>'.length, close);
+    // Compile only: running it needs a DOM. This is the check that `node --check`
+    // on admin.js cannot do, because the whole page is one template literal.
+    new vm.Script(script, { filename: 'admin-inline.js' });
+
+    // Execute just the hash helpers, which are pure and self-contained. They are
+    // lifted by anchor rather than by line number so a reshuffle does not
+    // silently turn this into a no-op.
+    const helpersStart = script.indexOf('function hashOf(');
+    // Search *after* the helpers: the same loop header appears earlier, inside
+    // `setPressed`, and anchoring on that first hit yields an empty slice.
+    const helpersEnd = script.indexOf("for (const b of document.querySelectorAll('#presets button'))", helpersStart);
+    assert(helpersStart > 0 && helpersEnd > helpersStart, 'the hash helpers are findable in the page script');
+    const helpers = new vm.Script(
+      script.slice(helpersStart, helpersEnd) + '\n;({ hashOf, hashPart });',
+      { filename: 'admin-hash.js' },
+    ).runInThisContext();
+
+    const encoded = helpers.hashOf({ w: 'from=2026-10-12&to=2026-11-10' });
+    // No leading `#`: the browser adds it when the value is assigned to
+    // `location.hash`, and `hashPart` accepts either form.
+    assertEqual(encoded, 'w=from%3D2026-10-12%26to%3D2026-11-10', 'the window is encoded as one value');
+    assertEqual(helpers.hashPart('#' + encoded, 'w'), 'from=2026-10-12&to=2026-11-10', 'and reads back intact');
+    assertEqual(helpers.hashPart(encoded, 'w'), 'from=2026-10-12&to=2026-11-10', 'with or without the leading #');
+    assertEqual(helpers.hashPart('#w=days%3D7&created=alice', 'w'), 'days=7', 'parts are order-independent');
+    assertEqual(helpers.hashPart('#w=days%3D7&created=alice', 'created'), 'alice', 'and both are readable');
+    assertEqual(helpers.hashPart('#created=alice', 'w'), null, 'a missing window is null, not garbage');
+    // The bug this locks: an unencoded window loses everything after the first `&`.
+    assert(!encoded.includes('&to='), 'no raw `&` survives into the hash');
   } finally {
     await gateway.close();
     store.close();
