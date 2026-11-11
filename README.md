@@ -812,7 +812,7 @@ dsh plugin --profile desktop add trae-cn-provider   # 需先完全退出桌面�
 
 **2. `prepublishOnly` 会先跑完 `npm run check`。**
 
-所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、六套 smoke）。
+所以 `npm publish` 不可能发出没通过检查的构建（语法、YAML、清单一致性、Config schema、八套 smoke）。
 
 ### 上架 dsh.so（社区插件市场）
 
