@@ -5,10 +5,13 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { parseExpiry, CRED_DIR, hostPlatform } from './env.js';
+import { parseExpiry, CRED_DIR, hostPlatform, loadCredentials } from './env.js';
+import { detectLocalConsoleHost } from './trae-local-credentials.js';
 
 const API_HOST = 'https://api.trae.cn';
-const AUTHORIZE_URL = 'https://www.trae.cn/authorization';
+// 消费版登录入口。企业版账号必须用账号自己的 consoleHost —— 见
+// resolveAuthorizeHost()。
+const DEFAULT_AUTHORIZE_HOST = 'https://www.trae.cn';
 const CLIENT_ID = 'ono9krqynydwx5';
 const EXCHANGE_PATH = '/trae/api/v3/oauth/ExchangeToken';
 const SIMPLE_REFRESH_PATH = '/cloudide/api/v3/trae/oauth/ExchangeToken';
@@ -222,19 +225,86 @@ export function redactSearch(search) {
   return parts.length ? `?${parts.join('&')}` : '';
 }
 
+/** 只接受干净的 https origin，避免把配置里的路径/账号拼进授权链接。 */
+function normalizeAuthorizeHost(value) {
+  try {
+    const url = new URL(String(value ?? '').trim());
+    if (url.protocol !== 'https:' || url.username || url.password) return '';
+    return url.origin;
+  } catch {
+    return '';
+  }
+}
+
+/** 刷新主机不一定是控制台；这些 host 只提供 API，打开 /authorization 会 404。 */
+function isApiOnlyHost(host) {
+  const hostname = new URL(host).hostname;
+  return hostname === 'api.trae.cn'
+    || hostname.startsWith('api.')
+    || hostname.startsWith('api-')
+    || hostname.endsWith('.mchost.guru')
+    || hostname.endsWith('.byteintlapi.com');
+}
+
+/**
+ * 选网页登录入口。
+ *
+ * 2026-11-18 TRAE 账号合并后，消费版 `www.trae.cn/authorization` 在未登录时
+ * 会跳到豆包/飞书账号页；企业账号在那里没有可用的登录方式。Trae 客户端
+ * 自己用的是 `loginHost`（企业版为 `console.enterprise.trae.cn`），其授权页
+ * 会进入企业登录（TRAE 企业邮箱 / 企业 SSO / 豆包飞书）。
+ *
+ * 优先级：显式配置 > 环境变量 > 本机客户端 `iCubeHostInfo.consoleHost` >
+ * 已保存凭据的 host > 消费版默认。
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.explicit] - 配置或命令行指定的 host。
+ * @param {string} [opts.credsHost] - 已保存凭据里的 host（调用方已知时传入；
+ *   传空串才会去读 `~/.trae-proxy/credentials.json`）。
+ * @param {string} [opts.localHost] - 本机客户端控制台 host；仅测试需要显式传。
+ * @returns {string} https origin
+ */
+export function resolveAuthorizeHost({ explicit = '', credsHost = '', localHost } = {}) {
+  let savedHost = credsHost;
+  if (!savedHost) {
+    try {
+      savedHost = loadCredentials()?.host || '';
+    } catch {
+      // 没有可读的旧凭据是正常状态（首次登录）。
+    }
+  }
+  const detectedLocal = localHost === undefined ? detectLocalConsoleHost() : localHost;
+  const candidates = [
+    [explicit, false],
+    [process.env.TRAE_PROXY_AUTHORIZE_HOST || '', false],
+    [detectedLocal, true],
+    [savedHost, true],
+  ];
+  for (const [value, rejectApiHost] of candidates) {
+    const host = normalizeAuthorizeHost(value);
+    if (!host) continue;
+    if (rejectApiHost && isApiOnlyHost(host)) continue;
+    return host;
+  }
+  return DEFAULT_AUTHORIZE_HOST;
+}
+
 /**
  * 走网页登录拿凭据。
  * @param {object} opts
  * @param {string} opts.ideVersion
+ * @param {string} [opts.authorizeHost] - 登录入口覆盖；空则自动探测。
  * @param {(url:string)=>void} [opts.onAuthorizeUrl] 拿到授权链接时回调
  * @param {(msg:string)=>void} [opts.onProgress]
  * @param {number} [opts.timeoutMs]
  */
-export async function webLogin({ ideVersion, onAuthorizeUrl, onProgress, timeoutMs = 30 * 60 * 1000 } = {}) {
+export async function webLogin({ ideVersion, authorizeHost = '', onAuthorizeUrl, onProgress, timeoutMs = 30 * 60 * 1000 } = {}) {
   const device = createDevice(ideVersion);
   const verifier = b64url(crypto.randomBytes(48));
   const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
   const log = (msg) => (onProgress ? onProgress(msg) : console.log(msg));
+  const loginHost = resolveAuthorizeHost({ explicit: authorizeHost });
+  log(`登录入口: ${loginHost}`);
 
   const server = http.createServer();
   await new Promise((resolve, reject) => {
@@ -246,7 +316,9 @@ export async function webLogin({ ideVersion, onAuthorizeUrl, onProgress, timeout
 
   const creds = {
     clientId: CLIENT_ID,
-    host: API_HOST,
+    // 企业账号的刷新必须打到自己的 host，否则 20101。回调里带 host 时会被
+    // Object.assign(creds, parsed.creds) 覆盖，这里只是没有 host 时的兜底。
+    host: loginHost === DEFAULT_AUTHORIZE_HOST ? API_HOST : loginHost,
     deviceInfo: device.deviceInfo,
     privateKeyPem: device.privateKeyPem,
     publicKeyPem: device.publicKeyPem,
@@ -339,7 +411,7 @@ export async function webLogin({ ideVersion, onAuthorizeUrl, onProgress, timeout
     });
     params.set('x_device_id', device.deviceInfo.DeviceID);
     params.set('x_machine_id', device.deviceInfo.MachineID);
-    const authorizeUrl = `${AUTHORIZE_URL}?${params.toString()}`;
+    const authorizeUrl = `${loginHost}/authorization?${params.toString()}`;
     if (onAuthorizeUrl) onAuthorizeUrl(authorizeUrl);
     else loginMessage(authorizeUrl);
   });

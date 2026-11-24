@@ -29,6 +29,10 @@ installShims();
 // would break this suite's module resolution.
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'trae-login-'));
 process.env.TRAE_PROXY_CRED_DIR = path.join(SCRATCH, '.trae-proxy');
+// Keep the end-to-end flow on the consumer entry even when the machine running
+// the suite has an enterprise Trae install; resolveAuthorizeHost() has its own
+// tests below.
+process.env.TRAE_PROXY_AUTHORIZE_HOST = 'https://www.trae.cn';
 
 const plugin = await load('lib/index.js');
 const realFetch = globalThis.fetch;
@@ -148,6 +152,57 @@ await test('redactSearch keeps key names and drops secret values', async () => {
   assert(redacted.includes('refreshToken=<redacted 6>'), `refresh token redacted, got ${redacted}`);
   assert(!redacted.includes('secret.jwt.value'), 'no jwt material survives');
   assertEqual(redactSearch(''), '', 'empty query stays empty');
+});
+
+await test('the authorize origin follows the account console, not a hardcoded consumer host', async () => {
+  const { resolveAuthorizeHost } = await load('src/trae-auth.js');
+  const savedEnv = process.env.TRAE_PROXY_AUTHORIZE_HOST;
+  delete process.env.TRAE_PROXY_AUTHORIZE_HOST;
+  // `credsHost` is passed explicitly so the resolver never reads the real
+  // ~/.trae-proxy/credentials.json (which would make this machine-dependent).
+  try {
+    assertEqual(
+      resolveAuthorizeHost({
+        explicit: 'https://console.enterprise.trae.cn',
+        credsHost: 'https://api.trae.cn',
+        localHost: '',
+      }),
+      'https://console.enterprise.trae.cn',
+      'explicit enterprise console wins',
+    );
+    assertEqual(
+      resolveAuthorizeHost({
+        explicit: 'https://console.enterprise.trae.cn/authorization?x=1',
+        credsHost: 'https://api.trae.cn',
+        localHost: '',
+      }),
+      'https://console.enterprise.trae.cn',
+      'path and query are dropped from an override',
+    );
+    assertEqual(
+      resolveAuthorizeHost({ credsHost: 'https://api.trae.cn', localHost: 'https://console.enterprise.trae.cn' }),
+      'https://console.enterprise.trae.cn',
+      'the local install console is used when there is no override',
+    );
+    assertEqual(
+      resolveAuthorizeHost({ credsHost: 'https://console.enterprise.trae.cn', localHost: '' }),
+      'https://console.enterprise.trae.cn',
+      'a saved enterprise login is a usable fallback',
+    );
+    assertEqual(
+      resolveAuthorizeHost({ explicit: 'http://console.enterprise.trae.cn', credsHost: 'https://api.trae.cn', localHost: '' }),
+      'https://www.trae.cn',
+      'a non-https override is refused',
+    );
+    assertEqual(
+      resolveAuthorizeHost({ credsHost: 'https://api.trae.cn', localHost: '' }),
+      'https://www.trae.cn',
+      'an API-only host never becomes a login page',
+    );
+  } finally {
+    if (savedEnv === undefined) delete process.env.TRAE_PROXY_AUTHORIZE_HOST;
+    else process.env.TRAE_PROXY_AUTHORIZE_HOST = savedEnv;
+  }
 });
 
 await test('a host without the commands service degrades instead of failing', async () => {

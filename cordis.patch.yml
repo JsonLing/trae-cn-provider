@@ -37,6 +37,10 @@
         ideVersion: ''
         displayName: 'Trae CN'
         loginCommand: trae-login
+        # Browser login/console origin. Empty = auto-detect from the local Trae
+        # install's iCubeHostInfo (enterprise builds point at
+        # console.enterprise.trae.cn; consumer builds at www.trae.cn).
+        authorizeHost: ''
         settingsNs: trae-cn-provider
         mountOpenAIEndpoint: true
         # Mount prefix on the host web server. The mounted handler owns the

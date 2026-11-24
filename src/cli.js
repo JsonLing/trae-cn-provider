@@ -71,11 +71,14 @@ function lanAddresses() {
 }
 
 async function cmdLogin() {
+  const { flags } = parseArgs(process.argv.slice(3));
+  const authorizeHost = typeof flags['authorize-host'] === 'string' ? flags['authorize-host'] : '';
   const env = detectEnv();
   console.log(`Trae CN 环境: ideVersion=${env.ideVersion} versionCode=${env.appVersionCode} (${env.source})`);
   console.log('即将在浏览器中打开 Trae 授权页，请在页面上登录你自己的账号。\n');
   const creds = await webLogin({
     ideVersion: env.ideVersion,
+    authorizeHost,
     onAuthorizeUrl: (url) => {
       console.log(`授权链接：\n${url}\n`);
       if (process.platform === 'darwin') {
@@ -794,7 +797,8 @@ const command = process.argv[2];
 if (!commands[command]) {
   console.log('用法: node src/cli.js <login|models|catalog:codex|init|serve|stop|chat|usage|keys|report>');
   console.log('');
-  console.log('  login                  浏览器登录 Trae 账号');
+  console.log('  login [--authorize-host <origin>]');
+  console.log('                         浏览器登录 Trae 账号（默认自动选企业/消费版入口）');
   console.log('  models                 列出可用模型');
   console.log('  catalog:codex [--out <file>] [--url <base>]');
   console.log('                         生成 Codex 桌面版下拉框读取的 ~/.codex/models.json');

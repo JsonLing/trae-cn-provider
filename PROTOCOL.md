@@ -11,7 +11,7 @@
 |---|---|
 | 聊天 / 模型目录（CN） | `https://trae-api-cn.mchost.guru` |
 | OAuth / 用户信息 | `https://api.trae.cn` |
-| 网页登录授权页 | `https://www.trae.cn/authorization` |
+| 网页登录授权页 | 账号控制台 + `/authorization`：消费版 `https://www.trae.cn`，企业版 `https://console.enterprise.trae.cn` |
 | 国际版（参考） | `a0ai-api-sg.byteintlapi.com` |
 
 ## 2. 请求头（IDE 头组）
@@ -107,9 +107,12 @@ POST https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param
 1. 生成 EC P-256 设备密钥对，构造 `DeviceInfo{DeviceID, MachineID, PlatformCode:"IDE_PC", DeviceType:"PC", DevicePublicKey: PEM, ClientVersion, ...}`
 2. PKCE：`verifier = base64url(48B随机)`，`challenge = base64url(sha256(verifier))`
 3. 本地起 HTTP 服务 `127.0.0.1:<随机端口>`，回调路径 `/authorize`
-4. 浏览器打开 `https://www.trae.cn/authorization?...`，参数含：
+4. 浏览器打开 `<consoleHost>/authorization?...`，参数含：
    `client_id=ono9krqynydwx5`、`login_channel=native_ide`、`auth_type=local`、`auth_callback_url=http://127.0.0.1:<port>/authorize`、
-   `code_challenge`/`code_challenge_method=S256`、`machine_id`、`device_id`、`x_app_version`、`x_app_type=stable`、`login_trace_id`
+   `code_challenge`/`code_challenge_method=S256`、`machine_id`、`device_id`、`x_app_version`、`x_app_type=stable`、`login_trace_id`。
+   `consoleHost` 从本机客户端 `iCubeHostInfo.consoleHost` 或已保存凭据的 `host` 读取：企业版是
+   `https://console.enterprise.trae.cn`，消费版是 `https://www.trae.cn`。**2026-11-18 账号合并后不能写死消费版**：
+   未登录时它会跳到豆包/飞书账号页，企业账号在那里没有可用入口。
 5. 回调 query 里的 `authCodeInfo` 是 URL 编码 JSON，取 `AuthCode`
 6. 换 token：`POST https://api.trae.cn/trae/api/v3/oauth/ExchangeToken`
    `{ClientID, AuthCode, CodeVerifier, DeviceInfo, IDEVersion}` → `Result{Token, RefreshToken, TokenExpireAt}`
@@ -259,7 +262,7 @@ x-ide-version: 3.4.1              # product.json 的 appVersion
 
 ## D. 网页登录回调的真实形态（**与参考实现的 authCodeInfo 完全不同**）
 
-`https://www.trae.cn/authorization` 会在回调上**直接下发凭据**，不是授权码：
+`<consoleHost>/authorization`（消费版 `www.trae.cn`，企业版 `console.enterprise.trae.cn`）会在回调上**直接下发凭据**，不是授权码：
 
 | 参数 | 内容 |
 |---|---|

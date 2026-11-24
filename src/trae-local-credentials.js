@@ -152,6 +152,7 @@ export const EDITIONS = {
 };
 
 const AUTH_KEY = 'iCubeAuthInfo://icube.cloudide';
+const HOST_INFO_KEY = 'iCubeHostInfo';
 const MACHINE_ID_KEY = 'telemetry.machineId';
 
 /** 哪些 edition 在本机存在 storage.json */
@@ -162,6 +163,53 @@ export function discoverEditions() {
     if (fs.existsSync(storageFile)) found.push({ id, ...edition, storageFile });
   }
   return found;
+}
+
+/** 只接受干净的 https origin；storage.json 是客户端可写的，不能直接拼进 URL。 */
+function httpsOrigin(value) {
+  try {
+    const url = new URL(String(value ?? '').trim());
+    if (url.protocol !== 'https:' || url.username || url.password) return '';
+    return url.origin;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 读取本机 Trae 客户端记录的控制台 host，**不触碰任何凭据**。
+ *
+ * 企业版客户端会把 `iCubeHostInfo.consoleHost` 写成
+ * `https://console.enterprise.trae.cn`；消费版则是 `https://www.trae.cn`。
+ * 网页登录必须从账号自己的控制台进入 —— 2026-11-18 账号合并后，
+ * 消费版 `www.trae.cn/authorization` 会把未登录用户送到豆包/飞书登录页，
+ * 企业账号在那里没有可用的登录方式。
+ *
+ * @param {string} editionId - `cn` | `solo` | `sg` | `solo-sg`
+ * @returns {string} https origin，读不到时返回空串
+ */
+export function readLocalConsoleHost(editionId) {
+  const edition = EDITIONS[editionId];
+  if (!edition) return '';
+  const storageFile = path.join(edition.userDir, 'globalStorage/storage.json');
+  try {
+    const storage = JSON.parse(fs.readFileSync(storageFile, 'utf8'));
+    let info = storage[HOST_INFO_KEY];
+    if (typeof info === 'string') info = JSON.parse(info);
+    if (!info || typeof info !== 'object') return '';
+    return httpsOrigin(info.consoleHost) || httpsOrigin(info.apiHost);
+  } catch {
+    return '';
+  }
+}
+
+/** 按 cn → solo → sg → solo-sg 顺序找本机控制台 host（第一个非空值）。 */
+export function detectLocalConsoleHost() {
+  for (const edition of discoverEditions()) {
+    const host = readLocalConsoleHost(edition.id);
+    if (host) return host;
+  }
+  return '';
 }
 
 /**
